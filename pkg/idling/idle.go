@@ -133,11 +133,12 @@ func ScaleProjectRCs(c *cache.Cache, namespace string) error {
 	}
 
 	for _, thisRC := range rcList.Items {
-		rcWDC, err := c.Indexer.ByIndex("dcByRC", thisRC.Name)
+		dc, err := c.Indexer.ByIndex("rcByDC", thisRC.ObjectMeta.Annotations[cache.OpenShiftDCName])
 		if err != nil {
 			return err
 		}
-		if len(rcWDC) != 0 {
+		if len(dc) == 0 {
+			glog.V(2).Infof("GOT HERE, lenDC==0 rc: %s ", thisRC.Name)
 			copy, err := kapi.Scheme.DeepCopy(thisRC)
 			if err != nil {
 				return err

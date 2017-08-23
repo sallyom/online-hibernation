@@ -92,27 +92,33 @@ func (idler *Idler) syncProject(namespace string) {
 
 	if !project.IsAsleep {
 		glog.V(2).Infof("Auto-idler: Syncing project: %s \n", project.Name)
-		var runningpods []interface{}
-		pods, err := idler.resources.Indexer.ByIndex("ofKind", cache.PodKind)
+		resObjProjPods, err := idler.resources.GetProjectPods(namespace)
 		if err != nil {
-			glog.Errorf("Auto-idler: Error getting pods: %#v", err)
+			glog.Errorf("Auto-idler: Error getting pods in ( %s ): %#v", namespace, err)
 		}
-		for _, pod := range pods {
-			if pod.(*cache.ResourceObject).Namespace == namespace && pod.(*cache.ResourceObject).IsStarted() {
-				runningpods = append(runningpods, pod)
+
+		svcs, err := idler.resources.GetProjectServices(namespace)
+		if err != nil {
+			glog.Errorf("Auto-idler: Error getting services in ( %s ): %#v", namespace, err)
+		}
+		var scalablePods []interface{}
+		var scalableResObjPods []interface{}
+		for _, svc := range svcs {
+			// Only consider pods with services for idling.
+			scalablePods := idler.resources.GetPodsForService(svc.(*cache.ResourceObject), resObjProjPods)
+			for _, pod := range scalablePods {
+				scalableResObjPods = append(scalableResObjPods, pod)
 			}
 		}
-		//If false, project is not currently idled
-		if !idler.checkIdledState(namespace) {
-			if len(runningpods) != 0 {
-				if err := idler.idleIfInactive(namespace, runningpods); err != nil {
-					glog.Errorf("Auto-idler: Error syncing project( %s ): %s", namespace, err)
-				}
-			} else {
-				glog.V(2).Infof("Auto-idler: Skipping project( %s ), no running pods found", namespace)
+
+		// If false, namespace (services in namespace) are not idled,
+		// i.e. endpoints in project have no idling annotations and len(scalablePods)==0
+		// Project is not currently idled if there are any running scalable pods in namespace.
+		if !idler.checkIdledState(namespace, len(scalableResObjPods)) {
+			if err := idler.idleIfInactive(namespace, scalablePods); err != nil {
+				glog.Errorf("Auto-idler: Error syncing project( %s ): %s", namespace, err)
 			}
 		} else {
-			glog.V(2).Infof("Auto-idler: Ignoring project( %s ), already in idled state.\n", namespace)
 			glog.V(2).Infof("Auto-idler: Project( %s )sync complete.\n", namespace)
 			return
 		}
@@ -189,7 +195,7 @@ func (idler *Idler) idleIfInactive(namespace string, pods []interface{}) error {
 			}
 		}
 	} else {
-		glog.V(2).Infof("Auto-idler: Ignoring project( %s ), currently in force-sleep..\n", namespace)
+		glog.V(2).Infof("Auto-idler: Ignoring project( %s ), currently in force-sleep.", namespace)
 	}
 
 	return nil
@@ -229,16 +235,20 @@ func (idler *Idler) getMetricsParams(namespace string) metrics.Parameters {
 }
 
 // checkIdledState returns true if project is idled, false if project is not currently idled
-func (idler *Idler) checkIdledState(namespace string) bool {
+func (idler *Idler) checkIdledState(namespace string, numScalablePods int) bool {
 	endpointInterface := idler.resources.KubeClient.Endpoints(namespace)
 	epList, err := endpointInterface.List(kapi.ListOptions{})
 	if err != nil {
-		glog.Fatalf("Auto-idler: Project( %s ): %s\n", namespace, err)
+		glog.Fatalf("Auto-idler: Project( %s ): %s", namespace, err)
 	}
 	for _, ep := range epList.Items {
 		if _, ok := ep.ObjectMeta.Annotations[unidlingapi.IdledAtAnnotation]; ok {
-			return true
+			if numScalablePods == 0 {
+				glog.V(2).Infof("Auto-idler: Project( %s )already in idled state.", namespace)
+				return true
+			}
 		}
 	}
+	glog.V(3).Infof("Auto-idler: Project( %s )not currently idled, checking network activity received...", namespace)
 	return false
 }
