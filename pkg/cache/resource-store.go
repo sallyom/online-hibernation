@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
+	"k8s.io/api/apps/v1beta2"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -66,6 +67,8 @@ func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*Resourc
 			return nil, err
 		}
 		return newResource, nil
+	case *v1beta2.StatefulSet:
+		s.excludeStatefulSetNS(r)
 	}
 	return nil, fmt.Errorf("unknown resource of type %T", resource)
 }
@@ -676,6 +679,10 @@ func (s *resourceStore) NewResourceFromRS(rs *v1beta1.ReplicaSet) (*ResourceObje
 		resource.DeletionTimestamp = rs.ObjectMeta.DeletionTimestamp.Time
 	}
 	return resource, nil
+}
+
+func (s *resourceStore) excludeStatefulSetNS(ss *v1beta2.StatefulSet) {
+	s.Exclude[ss.GetNamespace()] = true
 }
 
 func (s *resourceStore) NewResourceFromService(svc *corev1.Service) *ResourceObject {

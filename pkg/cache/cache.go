@@ -8,6 +8,7 @@ import (
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	appsv1 "github.com/openshift/client-go/apps/clientset/versioned/typed/apps/v1"
 	"k8s.io/api/extensions/v1beta1"
+	"k8s.io/api/apps/v1beta2"
 	extkclientv1beta1 "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
@@ -329,6 +330,17 @@ func (c *Cache) SetUpIndexer() {
 	}
 	rcr := kcache.NewReflector(rcLW, &corev1.ReplicationController{}, c.Indexer, 0)
 	go rcr.Run(c.stopChan)
+
+	ssLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.KubeClient.AppsV1beta2().StatefulSets(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.KubeClient.AppsV1beta2().StatefulSets(metav1.NamespaceAll).Watch(options)
+		},
+	}
+	ssr := kcache.NewReflector(ssLW, &v1beta2.StatefulSet{}, c.Indexer, 0)
+	go ssr.Run(c.stopChan)
 
 	rsLW := &kcache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
