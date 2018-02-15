@@ -601,13 +601,13 @@ func TestReplaceWithMultipleDoesNotConflict(t *testing.T) {
 
 	sss, err := store.ByIndex("byNamespaceAndKind", "somens5/"+SSKind)
 	if err != nil {
-		t.Fatalf("unexpected error: %v")
+		t.Fatalf("unexpected error: %v", err)
 	}
 
 	if assert.Len(t, sss, 1, "expected to have one ss in namespace somens5") {
 		selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"somessselector": "ssblah"}})
 		if err != nil {
-			t.Fatalf("unexpected error: %v")
+			t.Fatalf("unexpected error: %v", err)
 		}
 		resource := &ResourceObject{
 			UID:               "4445",
