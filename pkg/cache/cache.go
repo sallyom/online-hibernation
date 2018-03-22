@@ -7,6 +7,7 @@ import (
 	"github.com/openshift/api/apps/v1"
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	appsv1 "github.com/openshift/client-go/apps/clientset/versioned/typed/apps/v1"
+	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
 	"k8s.io/api/extensions/v1beta1"
 	extkclientv1beta1 "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
 
@@ -58,21 +59,23 @@ type ResourceIndexer interface {
 }
 
 type Cache struct {
-	Indexer    ResourceIndexer
-	OsClient   osclient.Interface
-	KubeClient kclient.Interface
-	Config     *restclient.Config
-	RESTMapper apimeta.RESTMapper
-	stopChan   <-chan struct{}
+	Indexer     ResourceIndexer
+	OsClient    osclient.Interface
+	KubeClient  kclient.Interface
+	IdlerClient iclient.IdlersGetter
+	Config      *restclient.Config
+	RESTMapper  apimeta.RESTMapper
+	stopChan    <-chan struct{}
 }
 
 func NewCache(osClient osclient.Interface, kubeClient kclient.Interface, config *restclient.Config, mapper apimeta.RESTMapper) *Cache {
 	return &Cache{
-		Indexer:    NewResourceStore(osClient, kubeClient),
-		OsClient:   osClient,
-		KubeClient: kubeClient,
-		Config:     config,
-		RESTMapper: mapper,
+		Indexer:     NewResourceStore(osClient, kubeClient),
+		OsClient:    osClient,
+		KubeClient:  kubeClient,
+		IdlerClient: idlerClient,
+		Config:      config,
+		RESTMapper:  mapper,
 	}
 }
 

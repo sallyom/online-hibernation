@@ -9,10 +9,17 @@ import:
 - package: k8s.io/apimachinery
   version: release-1.8
 - package: k8s.io/client-go
-  version: release-5.0
+  version: release-7.0
 - package: github.com/prometheus/client_golang
   version: 6373fd93345740fc045eab648524bcbb65c3e690
   subpackages:
   - prometheus
 - package: github.com/spf13/pflag
   version: ^1.0.0
+- package: github.com/openshift/origin-idler
+  version: prototype/kubebuilder-alpha
+  repo:    https://github.com/DirectXMan12/origin-idler.git
+  subpackages:
+  - pkg/apis
+  - pkg/client
+ 

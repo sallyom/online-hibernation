@@ -346,7 +346,7 @@ func TestSync(t *testing.T) {
 
 	for name, test := range tests {
 		t.Logf("Testing: %s", name)
-		config := &IdlerConfig{
+		config := &AutoIdlerConfig{
 			IdleSyncPeriod:  10 * time.Minute,
 			IdleQueryPeriod: 10 * time.Minute,
 			Threshold:       2000,
@@ -395,7 +395,7 @@ func TestSync(t *testing.T) {
 		})
 
 		fakeCache := cache.NewCache(fakeOClient, fakeClient, clientConfig, nil)
-		idler := NewIdler(config, fakeCache)
+		idler := NewAutoIdler(config, fakeCache)
 		for _, resource := range test.resources {
 			err := idler.resources.Indexer.AddResourceObject(resource)
 			if err != nil {

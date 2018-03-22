@@ -10,6 +10,7 @@ import (
 
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	"github.com/openshift/online-hibernation/pkg/cache"
+	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
 	"github.com/openshift/online-hibernation/pkg/forcesleep"
 	"github.com/openshift/online-hibernation/pkg/idling"
 	"github.com/prometheus/client_golang/api/prometheus"
@@ -25,13 +26,13 @@ import (
 	restclient "k8s.io/client-go/rest"
 )
 
-func createClients() (*restclient.Config, kclient.Interface, error) {
+func createClients() (*restclient.Config, kclient.Interface, iclient.Interface, error) {
 	return CreateClientsForConfig()
 }
 
 // CreateClientsForConfig creates and returns OpenShift and Kubernetes clients (as well as other useful
 // client objects) for the given client config.
-func CreateClientsForConfig() (*restclient.Config, kclient.Interface, error) {
+func CreateClientsForConfig() (*restclient.Config, kclient.Interface, iclient.Interface, error) {
 
 	clientConfig, err := restclient.InClusterConfig()
 	if err != nil {
@@ -40,7 +41,8 @@ func CreateClientsForConfig() (*restclient.Config, kclient.Interface, error) {
 
 	clientConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: cache.Codecs}
 	kc := kclient.NewForConfigOrDie(clientConfig)
-	return clientConfig, kc, err
+	ic := iclient.NewForConfigOrDie(clientConfig)
+	return clientConfig, kc, ic, err
 }
 
 func setupPprof(mux *http.ServeMux) {
@@ -97,7 +99,7 @@ func main() {
 	}
 
 	//Set up clients
-	restConfig, kubeClient, err := createClients()
+	restConfig, kubeClient, idlerClient, err := createClients()
 	osClient := osclient.NewForConfigOrDie(restConfig)
 	var prometheusClient prometheus.Client
 
@@ -130,7 +132,7 @@ func main() {
 	restMapper.Reset()
 
 	//Cache is a shared object that both Sleeper and Idler will hold a reference to and interact with
-	cache := cache.NewCache(osClient, kubeClient, restConfig, restMapper)
+	cache := cache.NewCache(osClient, kubeClient, idlerClient, restConfig, restMapper)
 	cache.Run(c)
 
 	sleeperConfig := &forcesleep.SleeperConfig{
@@ -178,7 +180,7 @@ func main() {
 
 	sleeper.Run(c)
 
-	idlerConfig := &idling.IdlerConfig{
+	autoIdlerConfig := &idling.AutoIdlerConfig{
 		PrometheusClient:   prometheusClient,
 		IdleSyncPeriod:     idleSyncPeriod,
 		IdleQueryPeriod:    idleQueryPeriod,
@@ -188,7 +190,7 @@ func main() {
 		ProjectSleepPeriod: projectSleepPeriod,
 	}
 
-	idler := idling.NewIdler(idlerConfig, cache)
+	idler := idling.NewAutoIdler(autoIdlerConfig, cache)
 	idler.Run(c)
 	<-c
 }

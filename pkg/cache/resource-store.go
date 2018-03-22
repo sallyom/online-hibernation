@@ -9,6 +9,8 @@ import (
 
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 
+	oidler "github.com/openshift/origin-idler/pkg/apis/idling/v1alpha2"
+	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -43,6 +45,7 @@ type ResourceObject struct {
 	Labels            map[string]string
 	Annotations       map[string]string
 	IsAsleep          bool
+	Idler			  oidler.Idler
 }
 
 type resourceStore struct {
@@ -50,6 +53,7 @@ type resourceStore struct {
 	kcache.Indexer
 	OsClient   osclient.Interface
 	KubeClient kclient.Interface
+	IdlerClient iclient.IdlersGetter
 }
 
 func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*ResourceObject, error) {
@@ -471,6 +475,7 @@ func NewResourceStore(osClient osclient.Interface, kubeClient kclient.Interface)
 		}),
 		OsClient:   osClient,
 		KubeClient: kubeClient,
+		IdlerClient: idlerClient,
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -729,6 +734,7 @@ func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *Res
 		LastSleepTime:    time.Time{},
 		ProjectSortIndex: 0.0,
 		IsAsleep:         false,
+		Idler:            oidler.Idler{},
 	}
 
 	// Parse any LastSleepTime annotation on the namespace
@@ -745,6 +751,15 @@ func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *Res
 				resource.IsAsleep = true
 			}
 		}
+	}
+
+	// Find any Idlers in the namespace
+	idlers, err := s.IdlerClient.Idlers(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		glog.Errorf("Error listing Idlers in namespace( %v ): %v", namespace.Name, err)
+	}
+	for _, range idlers {
+		
 	}
 	return resource
 }
@@ -784,3 +799,40 @@ func (s *resourceStore) getParsedTimeFromQuotaCreation(namespace *corev1.Namespa
 	}
 	return time.Time{}
 }
+
+// GetIdlerTargetScalables populates Idler IdlerSpec.TargetScalables
+func (s *resourceStore) GetIdlerTargetScalables(namespace string) ([]oidler.CrossGroupObjectReference, error) {
+	project, err := s.Indexer.GetProject(namespace)
+	if err != nil {
+		return nil, err
+	}
+		// Store the scalable resources in a map (this will become an annotation on the service later)
+		targetScalables := []oidler.CrossGroupObjectReference{}
+		unidledScales := []oidler.UnidleInfo
+		// get some scaleRefs then add them to targetScalables
+	    var scaleRefs []oidler.CrossGroupObjectReference
+		for _, scaleRef := range scaleRefs {
+			scaleRefPlusPreviousScale, err := someFunctoGetThat(scaleRef)
+			if err != nil {
+				return nil, err
+			}
+			// Update UnidleInfo here, also...for each scaleRef, get PreviousScale, then
+			// create UnidleInfo{ CrossGroupObjectReference, PreviousScale }
+			// then add that to IdlerStatus.UnidledScales
+			targetScalables = append(targetScalables, scaleRef)
+			unidledScales = append(unidledScales, scaleRefPlusPreviousScale)
+		}
+	return targetScalables, nil
+}
+
+// SomeFuncToGetThat returns the oidlerUnidleInfo struct
+func SomeFuncToGetThat(oidler.CrossGroupObjectReference)(oidler.UnidleInfo, err) {
+	return nil, nil
+}
+
+// GetIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
+func GetIdlerTriggerServiceNames(c *cache.Cache, namespace string) ([]string, error) {
+	// populate/update Idler.TriggerServiceNames
+	return nil, nil
+}
+
