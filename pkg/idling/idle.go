@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/openshift/online-hibernation/pkg/cache"
-	oidler "github.com/openshift/origin-idler/pkg/apis/idling/v1alpha2"
+	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 
 	appsv1 "github.com/openshift/api/apps/v1"
 	"k8s.io/api/extensions/v1beta1"
@@ -17,17 +17,32 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// GetIdlerTargetScalables populates Idler IdlerSpec.TargetScalables
-func GetIdlerTargetScalables(c *cache.Cache, namespace string) ([]oidler.CrossGroupObjectReference, error) {
-	project, err := c.GetProject(namespace)
+// UpdateIdler keeps project.Idler up-to-date
+func UpdateIdler(c *cache.NamespaceCache, namespace string, wantIdle bool) error {
+	idlerInterface := c.IdlerClient.Idlers(namespace)
+	//Need FindIdlerForNS method
+	updatedIdler := project.Idler.DeepCopy()
+	updatedIdler.Spec.WantIdle = wantIdle
+	updatedIdler.Spec.TargetScalables, err = getIdlerTargetScalables(c, namespace)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	updatedIdler.Spec.TriggerServiceNames, err = getIdlerTriggerServiceNames(c, namespace)
+	if err != nil {
+		return err
+	}
+	_, err = idlerInterface.Update(updatedIdler)
+	if err != nil {
+		return err
+	}
+}
+
+// getIdlerTargetScalables populates Idler IdlerSpec.TargetScalables
+func getIdlerTargetScalables(c *cache.Cache, namespace string) ([]svcidler.CrossGroupObjectReference, error) {
 		// Store the scalable resources in a map (this will become an annotation on the service later)
-		targetScalables := []oidler.CrossGroupObjectReference{}
-		unidledScales := []oidler.UnidleInfo
+		targetScalables := []svcidler.CrossGroupObjectReference{}
 		// get some scaleRefs then add them to targetScalables
-	    var scaleRefs []oidler.CrossGroupObjectReference
+	    var scaleRefs []svcidler.CrossGroupObjectReference
 		for _, scaleRef := range scaleRefs {
 			scaleRefPlusPreviousScale, err := someFunctoGetThat(scaleRef)
 			if err != nil {
@@ -37,33 +52,27 @@ func GetIdlerTargetScalables(c *cache.Cache, namespace string) ([]oidler.CrossGr
 			// create UnidleInfo{ CrossGroupObjectReference, PreviousScale }
 			// then add that to IdlerStatus.UnidledScales
 			targetScalables = append(targetScalables, scaleRef)
-			unidledScales = append(unidledScales, scaleRefPlusPreviousScale)
 		}
 	return targetScalables, nil
 }
 
-// SomeFuncToGetThat returns the oidlerUnidleInfo struct
-func SomeFuncToGetThat(oidler.CrossGroupObjectReference)(oidler.UnidleInfo, err) {
-	return nil, nil
-}
-
-// GetIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
-func GetIdlerTriggerServiceNames(c *cache.Cache, namespace string) ([]string, error) {
+// getIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
+func getIdlerTriggerServiceNames(c *cache.SvcCache, namespace string) ([]string, error) {
 	// populate/update Idler.TriggerServiceNames
 	return nil, nil
 }
 
 // IdleProject idles all scalables in a given namespace
-func IdleProject(c *cache.Cache, namespace string) error {
+func IdleProject(c *cache.ProjPodCache, namespace string) error {
 	project, err := c.GetProject(namespace)
 	if err != nil {
 		return err
 	}
 	// Something like
 	idlerInterface := c.IdlerClient.Idlers(namespace)
-	newIdler := project.Idler.DeepCopy()
-	newIdler.Spec.WantIdle = true
-	_, err = idlerInterface.Update(newIdler)
+	updatedIdler := project.Idler.DeepCopy()
+	updatedIdler.Spec.WantIdle = true
+	_, err = idlerInterface.Update(updatedIdler)
 	if err != nil {
 		return err
 	}
@@ -71,16 +80,16 @@ func IdleProject(c *cache.Cache, namespace string) error {
 }
 
 // UnidleProject unidles all scalables in a given namespace
-func UnidleProject(c *cache.Cache, namespace string) error {
+func UnidleProject(c *cache.ProjPodCache, namespace string) error {
 	project, err := c.GetProject(namespace)
 	if err != nil {
 		return err
 	}
 	// Something like
 	idlerInterface := c.IdlerClient.Idlers(namespace)
-	newIdler := project.Idler.DeepCopy()
-	newIdler.Spec.WantIdle = false
-	_, err = idlerInterface.Update(newIdler)
+	updatedIdler := project.Idler.DeepCopy()
+	updatedIdler.Spec.WantIdle = false
+	_, err = idlerInterface.Update(updatedIdler)
 	if err != nil {
 		return err
 	}

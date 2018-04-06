@@ -9,8 +9,9 @@ import (
 
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 
-	oidler "github.com/openshift/origin-idler/pkg/apis/idling/v1alpha2"
-	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
+	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
+	//iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
+	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +29,8 @@ const (
 	HibernationLabel        = "openshift.io/hibernate-include"
 )
 
+// ResourceObject is a wrapper around PodCache and NamespaceCache, 
+// because hibernation needs some custom items added to each of those.
 type ResourceObject struct {
 	Mutex             sync.RWMutex
 	UID               types.UID
@@ -45,25 +48,35 @@ type ResourceObject struct {
 	Labels            map[string]string
 	Annotations       map[string]string
 	IsAsleep          bool
-	Idler			  oidler.Idler
+	Idler			  svcidler.Idler
 }
 
+
+func resourceKey(obj interface{}) (string, error) {
+	resObj := obj.(*ResourceObject)
+	return string(resObj.UID), nil
+}
+
+// ResourceIndexer holds methods for ResourceObject store
+type ResourceIndexer interface {
+   kcache.Indexer
+   UpdateResourceObject(obj *ResourceObject) error
+   DeleteResourceObject(obj *ResourceObject) error
+   AddResourceObject(obj *ResourceObject) error
+}
+
+// resourceStore is a wrapper for pod cache and namespace cache
 type resourceStore struct {
 	mu sync.RWMutex
 	kcache.Indexer
 	OsClient   osclient.Interface
 	KubeClient kclient.Interface
-	IdlerClient iclient.IdlersGetter
 }
 
 func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*ResourceObject, error) {
 	switch r := resource.(type) {
 	case *corev1.Pod:
 		return s.NewResourceFromPod(r), nil
-	case *corev1.ReplicationController:
-		return s.NewResourceFromRC(r), nil
-	case *corev1.Service:
-		return s.NewResourceFromService(r), nil
 	case *corev1.Namespace:
 		labels := r.GetLabels()
 		if include, ok := labels[HibernationLabel]; ok && include == "true" {
@@ -72,18 +85,96 @@ func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*Resourc
 			glog.V(2).Infof("Excluding namespace( %s )from hibernation, label( %s=true )not found.", r.Name, HibernationLabel)
 			return nil, nil
 		}
-	case *v1beta1.ReplicaSet:
-		newResource, err := s.NewResourceFromRS(r)
-		if err != nil {
-			return nil, err
-		}
-		return newResource, nil
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown resource of type %T", resource)
 }
 
+// Adds a new runningtime start value to a resource object
+func (s *resourceStore) startResource(r *ResourceObject) {
+	UID := string(r.UID)
+	if !s.ResourceInCache(UID) {
+		s.Indexer.Add(r)
+	}
+
+	// Make sure object was successfully created before working on it
+	obj, exists, err := s.GetResourceByKey(UID)
+	if err != nil {
+		glog.Errorf("Error: %v", err)
+	}
+
+	if exists {
+		objCopy := obj.DeepCopy()
+		if err != nil {
+			glog.Errorf("Couldn't copy resource from cache: %v", err)
+			return
+		}
+		objCopy.Kind = r.Kind
+		s.Indexer.Update(objCopy)
+		if !objCopy.IsStarted() {
+			runTime := &RunningTime{
+				Start: time.Now(),
+			}
+			objCopy.RunningTimes = append(objCopy.RunningTimes, runTime)
+			s.Indexer.Update(objCopy)
+		}
+	} else {
+		glog.Errorf("Error starting resource: could not find resource %s %s\n", r.Name, UID)
+		return
+	}
+}
+
+// Adds an end time to a resource object
+func (s *resourceStore) stopResource(r *ResourceObject) {
+	var stopTime time.Time
+	resourceTime := r.DeletionTimestamp
+	UID := string(r.UID)
+
+	// See if we already have a reference to this resource in cache
+	if s.ResourceInCache(UID) {
+		// Use the resource's given deletion time, if it exists
+		if !resourceTime.IsZero() {
+			stopTime = resourceTime
+		}
+	} else {
+		// If resource is not in cache, then ignore Delete event
+		return
+	}
+
+	// If there is an error with the given deletion time, use "now"
+	now := time.Now()
+	if stopTime.After(now) || stopTime.IsZero() {
+		stopTime = now
+	}
+
+	obj, exists, err := s.GetResourceByKey(UID)
+	if err != nil {
+		glog.Errorf("Error: %v", err)
+	}
+	if exists {
+		objCopy := obj.DeepCopy()
+		if err != nil {
+			glog.Errorf("Couldn't copy resource from cache: %v", err)
+			return
+		}
+		runTimeCount := len(objCopy.RunningTimes)
+
+		if objCopy.IsStarted() {
+			objCopy.RunningTimes[runTimeCount-1].End = stopTime
+			if err := s.Indexer.Update(objCopy); err != nil {
+				glog.Errorf("Error: %s", err)
+			}
+		}
+	} else {
+		glog.Errorf("Did not find resource %s %s\n", r.Name, UID)
+	}
+}
+
 func (s *resourceStore) AddOrModify(obj interface{}) error {
 	switch r := obj.(type) {
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil
 	case *corev1.Pod:
 		resObj, err := s.NewResourceFromInterface(obj.(*corev1.Pod))
 		if err != nil {
@@ -100,61 +191,6 @@ func (s *resourceStore) AddOrModify(obj interface{}) error {
 			s.startResource(resObj)
 		case corev1.PodSucceeded, corev1.PodFailed, corev1.PodUnknown:
 			s.stopResource(resObj)
-		}
-	case *corev1.ReplicationController:
-		resObj, err := s.NewResourceFromInterface(obj.(*corev1.ReplicationController))
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		glog.V(3).Infof("Received ADD/MODIFY for RC: %s\n", resObj.Name)
-		// If RC has more than 0 active replicas, make sure it's started in cache
-		if r.Status.Replicas > 0 {
-			s.startResource(resObj)
-		} else { // replicas == 0
-			s.stopResource(resObj)
-		}
-	case *v1beta1.ReplicaSet:
-		resObj, err := s.NewResourceFromInterface(obj.(*v1beta1.ReplicaSet))
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		glog.V(3).Infof("Received ADD/MODIFY for RS: %s\n", resObj.Name)
-		// If RS has more than 0 active replicas, make sure it's started in cache
-		if r.Status.Replicas > 0 {
-			s.startResource(resObj)
-		} else { // replicas == 0
-			s.stopResource(resObj)
-		}
-	case *corev1.Service:
-		resObj, err := s.NewResourceFromInterface(obj.(*corev1.Service))
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		glog.V(3).Infof("Received ADD/MODIFY for Service: %s\n", resObj.Name)
-		UID := string(resObj.UID)
-		obj, exists, err := s.GetResourceByKey(UID)
-		if err != nil {
-			return err
-		}
-		if exists {
-			res, err := Scheme.DeepCopy(obj)
-			if err != nil {
-				return err
-			}
-			resource := res.(*ResourceObject)
-			resource.Kind = ServiceKind
-			return s.Indexer.Update(resource)
-		} else {
-			s.Indexer.Add(resObj)
 		}
 	case *corev1.Namespace:
 		resObj, err := s.NewResourceFromInterface(obj.(*corev1.Namespace))
@@ -182,12 +218,11 @@ func (s *resourceStore) AddOrModify(obj interface{}) error {
 			return err
 		}
 		if exists {
-			res, err := Scheme.DeepCopy(obj)
+			objCopy := obj.DeepCopy()
 			if err != nil {
 				return err
 			}
-			resource := res.(*ResourceObject)
-			return s.Indexer.Update(resource)
+			return s.Indexer.Update(objCopy)
 		} else {
 			if r.Status.Phase == corev1.NamespaceActive {
 				glog.Errorf("Project not in cache")
@@ -202,7 +237,9 @@ func (s *resourceStore) AddOrModify(obj interface{}) error {
 func (s *resourceStore) DeleteKapiResource(obj interface{}) error {
 	glog.V(3).Infof("Received DELETE event\n")
 	switch r := obj.(type) {
-	case *corev1.Pod, *corev1.ReplicationController, *v1beta1.ReplicaSet:
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil
+	case *corev1.Pod:
 		resObj, err := s.NewResourceFromInterface(r)
 		if err != nil {
 			return err
@@ -213,18 +250,6 @@ func (s *resourceStore) DeleteKapiResource(obj interface{}) error {
 		UID := string(resObj.UID)
 		if s.ResourceInCache(UID) {
 			s.stopResource(resObj)
-		}
-	case *corev1.Service:
-		resObj, err := s.NewResourceFromInterface(r)
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		UID := string(resObj.UID)
-		if s.ResourceInCache(UID) {
-			s.Indexer.Delete(resObj)
 		}
 	case *corev1.Namespace:
 		resObj, err := s.NewResourceFromInterface(r)
@@ -255,7 +280,9 @@ func (s *resourceStore) Add(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch r := obj.(type) {
-	case *corev1.Namespace, *corev1.Service, *corev1.Pod, *corev1.ReplicationController, *v1beta1.ReplicaSet:
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil
+	case *corev1.Namespace, *corev1.Pod:
 		if err := s.AddOrModify(r); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -269,7 +296,9 @@ func (s *resourceStore) Delete(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch obj.(type) {
-	case *corev1.Namespace, *corev1.Service, *corev1.Pod, *corev1.ReplicationController, *v1beta1.ReplicaSet:
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil
+	case *corev1.Namespace, *corev1.Pod:
 		if err := s.DeleteKapiResource(obj); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -283,7 +312,9 @@ func (s *resourceStore) Update(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch r := obj.(type) {
-	case *corev1.Namespace, *corev1.Service, *corev1.Pod, *corev1.ReplicationController, *v1beta1.ReplicaSet:
+	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		return nil
+	case *corev1.Namespace, *corev1.Pod:
 		if err := s.AddOrModify(r); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -309,7 +340,7 @@ func (s *resourceStore) DeleteResourceObject(obj *ResourceObject) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch obj.Kind {
-	case PodKind, RCKind, ServiceKind, RSKind:
+	case PodKind:
 		UID := string(obj.UID)
 		if s.ResourceInCache(UID) {
 			// Should this be stopResource?
@@ -391,7 +422,9 @@ func (s *resourceStore) Replace(objs []interface{}, resVer string) error {
 	s.Indexer.Replace(objsToSave, resVer)
 	for _, obj := range objs {
 		switch r := obj.(type) {
-		case *corev1.Namespace, *corev1.Service, *corev1.Pod, *corev1.ReplicationController, *v1beta1.ReplicaSet:
+		case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+			return nil
+		case *corev1.Namespace, *corev1.Pod:
 			if err := s.AddOrModify(r); err != nil {
 				return err
 			}
@@ -459,11 +492,6 @@ func (s *resourceStore) AddIndexers(newIndexers kcache.Indexers) error {
 	return s.Indexer.AddIndexers(newIndexers)
 }
 
-func resourceKey(obj interface{}) (string, error) {
-	resObj := obj.(*ResourceObject)
-	return string(resObj.UID), nil
-}
-
 // NewResourceStore creates an Indexer store with the given key function
 func NewResourceStore(osClient osclient.Interface, kubeClient kclient.Interface) *resourceStore {
 	store := &resourceStore{
@@ -475,11 +503,35 @@ func NewResourceStore(osClient osclient.Interface, kubeClient kclient.Interface)
 		}),
 		OsClient:   osClient,
 		KubeClient: kubeClient,
-		IdlerClient: idlerClient,
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	return store
+}
+
+// Keying functions for Indexer
+func indexResourceByNamespace(obj interface{}) ([]string, error) {
+	object := obj.(*ResourceObject)
+	return []string{object.Namespace}, nil
+}
+
+func getProjectResource(obj interface{}) ([]string, error) {
+	object := obj.(*ResourceObject)
+	if object.Kind == ProjectKind {
+		return []string{object.Name}, nil
+	}
+	return []string{}, nil
+}
+
+func getAllResourcesOfKind(obj interface{}) ([]string, error) {
+	object := obj.(*ResourceObject)
+	return []string{object.Kind}, nil
+}
+
+func indexResourceByNamespaceAndKind(obj interface{}) ([]string, error) {
+	object := obj.(*ResourceObject)
+	fullName := object.Namespace + "/" + object.Kind
+	return []string{fullName}, nil
 }
 
 type RunningTime struct {
@@ -487,90 +539,9 @@ type RunningTime struct {
 	End   time.Time
 }
 
-// resourceStore methods
-// Adds a new runningtime start value to a resource object
-func (s *resourceStore) startResource(r *ResourceObject) {
-	UID := string(r.UID)
-	if !s.ResourceInCache(UID) {
-		s.Indexer.Add(r)
-	}
+// ResourceObject methods
 
-	// Make sure object was successfully created before working on it
-	obj, exists, err := s.GetResourceByKey(UID)
-	if err != nil {
-		glog.Errorf("Error: %v", err)
-	}
-
-	if exists {
-		res, err := Scheme.DeepCopy(obj)
-		if err != nil {
-			glog.Errorf("Couldn't copy resource from cache: %v", err)
-			return
-		}
-		resource := res.(*ResourceObject)
-		resource.Kind = r.Kind
-		s.Indexer.Update(resource)
-		if !resource.IsStarted() {
-			runTime := &RunningTime{
-				Start: time.Now(),
-			}
-			resource.RunningTimes = append(resource.RunningTimes, runTime)
-			s.Indexer.Update(resource)
-		}
-	} else {
-		glog.Errorf("Error starting resource: could not find resource %s %s\n", r.Name, UID)
-		return
-	}
-}
-
-// Adds an end time to a resource object
-func (s *resourceStore) stopResource(r *ResourceObject) {
-	var stopTime time.Time
-	resourceTime := r.DeletionTimestamp
-	UID := string(r.UID)
-
-	// See if we already have a reference to this resource in cache
-	if s.ResourceInCache(UID) {
-		// Use the resource's given deletion time, if it exists
-		if !resourceTime.IsZero() {
-			stopTime = resourceTime
-		}
-	} else {
-		// If resource is not in cache, then ignore Delete event
-		return
-	}
-
-	// If there is an error with the given deletion time, use "now"
-	now := time.Now()
-	if stopTime.After(now) || stopTime.IsZero() {
-		stopTime = now
-	}
-
-	obj, exists, err := s.GetResourceByKey(UID)
-	if err != nil {
-		glog.Errorf("Error: %v", err)
-	}
-	if exists {
-		res, err := Scheme.DeepCopy(obj)
-		if err != nil {
-			glog.Errorf("Couldn't copy resource from cache: %v", err)
-			return
-		}
-		resource := res.(*ResourceObject)
-		runTimeCount := len(resource.RunningTimes)
-
-		if resource.IsStarted() {
-			resource.RunningTimes[runTimeCount-1].End = stopTime
-			if err := s.Indexer.Update(resource); err != nil {
-				glog.Errorf("Error: %s", err)
-			}
-		}
-	} else {
-		glog.Errorf("Did not find resource %s %s\n", r.Name, UID)
-	}
-}
-
-// Checks to see if a resource is stopped in our cache
+// IsStopped checks to see if a resource (pod) is stopped in our cache
 // Ie, the resource's most recent RunningTime has a specified End time
 func (r *ResourceObject) IsStopped() bool {
 	runtimes := len(r.RunningTimes)
@@ -583,6 +554,36 @@ func (r *ResourceObject) IsStopped() bool {
 
 func (r *ResourceObject) IsStarted() bool {
 	return !r.IsStopped()
+}
+
+func (in *ResourceObject) DeepCopyInto(out *ResourceObject) {
+	*out = *in
+	out.UID = in.UID
+	out.Name = in.Name
+	out.Namespace = in.Namespace
+	out.Kind = in.Kind
+	out.Terminating = in.Terminating
+	out.ResourceVersion = in.ResourceVersion
+	out.RunningTimes = in.RunningTimes
+	out.MemoryRequested = in.MemoryRequested
+	out.LastSleepTime = in.LastSleepTime
+	out.ProjectSortIndex = in.ProjectSortIndex
+	out.DeletionTimestamp = in.DeletionTimestamp
+	out.Selectors = in.Selectors
+	out.Labels = in.Labels
+	out.Annotations = in.Annotations
+	out.IsAsleep = in.IsAsleep
+	out.Idler = in.Idler
+	return
+}
+
+func (in *ResourceObject) DeepCopy() *ResourceObject {
+	if in == nil {
+		return nil
+	}
+	out := new(ResourceObject)
+	in.DeepCopyInto(out)
+	return out
 }
 
 func (r *ResourceObject) GetResourceRuntime(period time.Duration) (time.Duration, bool) {
@@ -668,63 +669,6 @@ func (s *resourceStore) NewResourceFromPod(pod *corev1.Pod) *ResourceObject {
 	return resource
 }
 
-func (s *resourceStore) NewResourceFromRC(rc *corev1.ReplicationController) *ResourceObject {
-	resource := &ResourceObject{
-		UID:             rc.GetUID(),
-		Name:            rc.GetName(),
-		Namespace:       rc.GetNamespace(),
-		Kind:            RCKind,
-		ResourceVersion: rc.GetResourceVersion(),
-		RunningTimes:    make([]*RunningTime, 0),
-		Selectors:       labels.SelectorFromSet(rc.Spec.Selector),
-		Labels:          rc.GetLabels(),
-	}
-
-	if rc.ObjectMeta.DeletionTimestamp.IsZero() {
-		resource.DeletionTimestamp = time.Time{}
-	} else {
-		resource.DeletionTimestamp = rc.ObjectMeta.DeletionTimestamp.Time
-	}
-	return resource
-}
-
-func (s *resourceStore) NewResourceFromRS(rs *v1beta1.ReplicaSet) (*ResourceObject, error) {
-	selector, err := metav1.LabelSelectorAsSelector(rs.Spec.Selector)
-	if err != nil {
-		return nil, err
-	}
-	resource := &ResourceObject{
-		UID:             rs.GetUID(),
-		Name:            rs.GetName(),
-		Namespace:       rs.GetNamespace(),
-		Kind:            RSKind,
-		ResourceVersion: rs.GetResourceVersion(),
-		RunningTimes:    make([]*RunningTime, 0),
-		Selectors:       selector,
-		Labels:          rs.GetLabels(),
-	}
-
-	if rs.ObjectMeta.DeletionTimestamp.IsZero() {
-		resource.DeletionTimestamp = time.Time{}
-	} else {
-		resource.DeletionTimestamp = rs.ObjectMeta.DeletionTimestamp.Time
-	}
-	return resource, nil
-}
-
-func (s *resourceStore) NewResourceFromService(svc *corev1.Service) *ResourceObject {
-	resource := &ResourceObject{
-		UID:             svc.GetUID(),
-		Name:            svc.GetName(),
-		Namespace:       svc.GetNamespace(),
-		Kind:            ServiceKind,
-		ResourceVersion: svc.GetResourceVersion(),
-		Selectors:       labels.SelectorFromSet(svc.Spec.Selector),
-	}
-
-	return resource
-}
-
 func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *ResourceObject {
 	resource := &ResourceObject{
 		UID:              types.UID(namespace.Name),
@@ -734,7 +678,7 @@ func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *Res
 		LastSleepTime:    time.Time{},
 		ProjectSortIndex: 0.0,
 		IsAsleep:         false,
-		Idler:            oidler.Idler{},
+		Idler:            svcidler.Idler{},
 	}
 
 	// Parse any LastSleepTime annotation on the namespace
@@ -752,15 +696,20 @@ func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *Res
 			}
 		}
 	}
-
 	// Find any Idlers in the namespace
-	idlers, err := s.IdlerClient.Idlers(namespace).List(metav1.ListOptions{})
-	if err != nil {
-		glog.Errorf("Error listing Idlers in namespace( %v ): %v", namespace.Name, err)
-	}
-	for _, range idlers {
-		
-	}
+    //idlers, err := ic.Idlers(namespace.Name).List(metav1.ListOptions{})
+    //if err != nil {
+    //        glog.Errorf("Error listing Idlers in namespace( %v ): %v", namespace.Name, err)
+    //}
+	//switch {
+	//case len(idlers.Items) > 1:
+    //    glog.V(2).Infof("WHY ARE THERE MORE THAN 1 IDLER IN THIS NAMESPACE?")
+	//case len(idlers.Items) == 0:
+		// Populate and Add an idler to resourceObject, with wantIdle=false
+	//case len(idlers.Items) == 1:
+	//	glog.V(2).Infof("Idler( %v )detected in project( %s ).", idlers.Items[0], namespace)
+	//	resource.Idler = idlers.Items[0]
+	//}
 	return resource
 }
 
@@ -786,13 +735,9 @@ func (s *resourceStore) getParsedTimeFromQuotaCreation(namespace *corev1.Namespa
 		}
 		return parsedTime
 	} else {
-		copy, err := Scheme.DeepCopy(namespace)
-		if err != nil {
-			glog.Errorf("Error copying project: %v", err)
-		}
-		newNamespace := copy.(*corev1.Namespace)
-		delete(newNamespace.Annotations, LastSleepTimeAnnotation)
-		_, err = s.KubeClient.CoreV1().Namespaces().Update(newNamespace)
+		nsCopy := namespace.DeepCopy()
+		delete(nsCopy.Annotations, LastSleepTimeAnnotation)
+		_, err = s.KubeClient.CoreV1().Namespaces().Update(nsCopy)
 		if err != nil {
 			glog.Errorf("Error deleting project LastSleepTime: %v", err)
 		}
@@ -800,38 +745,24 @@ func (s *resourceStore) getParsedTimeFromQuotaCreation(namespace *corev1.Namespa
 	return time.Time{}
 }
 
+// TODO WRITE THIS
 // GetIdlerTargetScalables populates Idler IdlerSpec.TargetScalables
-func (s *resourceStore) GetIdlerTargetScalables(namespace string) ([]oidler.CrossGroupObjectReference, error) {
-	project, err := s.Indexer.GetProject(namespace)
+func (c *ProjPodCache) GetIdlerTargetScalables(namespace string) ([]svcidler.CrossGroupObjectReference, error) {
+	project, err := c.GetProject(namespace)
 	if err != nil {
 		return nil, err
 	}
-		// Store the scalable resources in a map (this will become an annotation on the service later)
-		targetScalables := []oidler.CrossGroupObjectReference{}
-		unidledScales := []oidler.UnidleInfo
-		// get some scaleRefs then add them to targetScalables
-	    var scaleRefs []oidler.CrossGroupObjectReference
-		for _, scaleRef := range scaleRefs {
-			scaleRefPlusPreviousScale, err := someFunctoGetThat(scaleRef)
-			if err != nil {
-				return nil, err
-			}
-			// Update UnidleInfo here, also...for each scaleRef, get PreviousScale, then
-			// create UnidleInfo{ CrossGroupObjectReference, PreviousScale }
-			// then add that to IdlerStatus.UnidledScales
-			targetScalables = append(targetScalables, scaleRef)
-			unidledScales = append(unidledScales, scaleRefPlusPreviousScale)
-		}
+	glog.V(2).Infof("Project: %s", project.Name)
+	// Store the scalable resources in a map (this will become an annotation on the service later)
+	targetScalables := []svcidler.CrossGroupObjectReference{}
+	// get some scaleRefs then add them to targetScalables
+	//var scaleRefs []svcidler.CrossGroupObjectReference
 	return targetScalables, nil
 }
 
-// SomeFuncToGetThat returns the oidlerUnidleInfo struct
-func SomeFuncToGetThat(oidler.CrossGroupObjectReference)(oidler.UnidleInfo, err) {
-	return nil, nil
-}
-
+// TODO WRITE THIS
 // GetIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
-func GetIdlerTriggerServiceNames(c *cache.Cache, namespace string) ([]string, error) {
+func GetIdlerTriggerServiceNames(c *SvcCache, namespace string) ([]string, error) {
 	// populate/update Idler.TriggerServiceNames
 	return nil, nil
 }

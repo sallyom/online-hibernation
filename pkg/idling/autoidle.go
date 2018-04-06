@@ -30,13 +30,13 @@ type AutoIdlerConfig struct {
 // AutoIdler is the auto-idler object
 type AutoIdler struct {
 	config    *AutoIdlerConfig
-	resources *cache.Cache
+	resources *cache.ProjPodCache
 	queue     workqueue.RateLimitingInterface
 	stopChan  <-chan struct{}
 }
 
 // NewAutoIdler returns an AutoIdler object
-func NewAutoIdler(ic *AutoIdlerConfig, c *cache.Cache) *AutoIdler {
+func NewAutoIdler(ic *AutoIdlerConfig, c *cache.ProjPodCache) *AutoIdler {
 	ctrl := &AutoIdler{
 		config:    ic,
 		resources: c,

@@ -8,6 +8,7 @@ import (
 
 	"github.com/openshift/online-hibernation/pkg/cache"
 	"github.com/openshift/online-hibernation/pkg/idling"
+	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 
 	"github.com/golang/glog"
 
@@ -40,15 +41,15 @@ type SleeperConfig struct {
 
 type Sleeper struct {
 	config            *SleeperConfig
-	resources         *cache.Cache
+	resources	      *cache.ProjPodCache
 	projectSleepQuota *corev1.ResourceQuota
 	stopChan          <-chan struct{}
 }
 
-func NewSleeper(sc *SleeperConfig, c *cache.Cache) *Sleeper {
+func NewSleeper(sc *SleeperConfig, resources *cache.ProjPodCache, podc *cache.PodCache) *Sleeper {
 	ctrl := &Sleeper{
 		config:    sc,
-		resources: c,
+		resources: resources,
 		projectSleepQuota: &corev1.ResourceQuota{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: ProjectSleepQuotaName,
@@ -75,12 +76,12 @@ func (s *Sleeper) Run(stopChan <-chan struct{}) {
 // Spawns goroutines to sync projects
 func (s *Sleeper) Sync() {
 	glog.V(1).Infof("Force-sleeper: Running project sync")
-	projects, err := s.resources.Indexer.ByIndex("ofKind", cache.ProjectKind)
-	if err != nil {
-		glog.Errorf("Force-sleeper: Error getting projects for sync: %s", err)
-		return
-	}
-	sort.Sort(Projects(projects))
+    projects, err := s.resources.Indexer.ByIndex("ofKind", cache.ProjectKind)
+    if err != nil {
+            glog.Errorf("Force-sleeper: Error getting projects for sync: %s", err)
+            return
+    }
+    sort.Sort(Projects(projects))
 
 	namespaces := make(chan string, len(projects))
 	for i := 1; i <= s.config.SyncWorkers; i++ {
@@ -146,45 +147,11 @@ func (s *Sleeper) applyProjectSleep(namespace string, sleepTime, wakeTime time.T
 
 	failed := false
 
-	glog.V(2).Infof("Force-sleeper: Annotating services in project( %s )", namespace)
-	err = idling.AddProjectPreviousScaleAnnotation(s.resources, namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: %s", err)
-	}
-	glog.V(2).Infof("Force-sleeper: Scaling DCs in project( %s )", namespace)
-	err = idling.ScaleProjectDCs(s.resources, namespace)
+	glog.V(2).Infof("Force-sleeper: Scaling Resources in project( %s ) to 0", namespace)
+	err = idling.ScaleProjectScalables(s.resources, namespace)
 	if err != nil {
 		failed = true
 		glog.Errorf("Force-sleeper: Error scaling DCs in project( %s ): %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Force-sleeper: Scaling RCs in project( %s )", namespace)
-	err = idling.ScaleProjectRCs(s.resources, namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: Error scaling RCs in project( %s ): %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Force-sleeper: Scaling ReplicaSets in project( %s )", namespace)
-	err = idling.ScaleProjectRSs(s.resources, namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: Error scaling ReplicaSets in project( %s ): %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Force-sleeper: Scaling Deploymentss in project( %s )", namespace)
-	err = idling.ScaleProjectDeployments(s.resources, namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: Error scaling Deployments in project( %s ): %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Force-sleeper: Deleting pods in project( %s )", namespace)
-	err = idling.DeleteProjectPods(s.resources, namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: Error deleting pods in project( %s ): %s", namespace, err)
 	}
 
 	glog.V(2).Infof("Force-sleeper: Clearing cache for project( %s )", namespace)
@@ -221,39 +188,39 @@ func (s *Sleeper) addNamespaceSleepTimeAnnotation(name string, sleepTime time.Ti
 // Removes the cache.LastSleepTimeAnnotation to a namespace in the cluster
 func (s *Sleeper) removeNamespaceSleepTimeAnnotation(name string) error {
 	ns, err := s.resources.KubeClient.CoreV1().Namespaces().Get(name, metav1.GetOptions{})
-	nsCopy, err := cache.Scheme.DeepCopy(ns)
+	nsCopy, err := ns.DeepCopy()
 	if err != nil {
 		return fmt.Errorf("Force-sleeper: %s", err)
 	}
-	project := nsCopy.(*corev1.Namespace)
-	if project.Annotations == nil {
+	if nsCopy.Annotations == nil {
 		// Sleep time annotation already doesn't exist
 		return nil
 	}
 
-	delete(project.Annotations, cache.LastSleepTimeAnnotation)
-	_, err = s.resources.KubeClient.CoreV1().Namespaces().Update(project)
+	delete(nsCopy.Annotations, cache.LastSleepTimeAnnotation)
+	_, err = s.resources.KubeClient.CoreV1().Namespaces().Update(nsCopy)
 	if err != nil {
 		return fmt.Errorf("Force-sleeper: %s", err)
 	}
 	return nil
 }
 
+// clearProjectCache removes all pods from ProjPodCache for given namespace
 func (s *Sleeper) clearProjectCache(namespace string) error {
-	resources, err := s.resources.Indexer.ByIndex("byNamespace", namespace)
+	pods, err := s.resources.Indexer.ByIndex("byNamespace", namespace)
 	if err != nil {
 		return fmt.Errorf("Force-sleeper: %s", err)
 	}
-	for _, resource := range resources {
-		r := resource.(*cache.ResourceObject)
-		if r.Kind != cache.ProjectKind && r.Kind != cache.ServiceKind {
-			s.resources.Indexer.DeleteResourceObject(r)
+	for _, pod := range pods {
+		rpod := pod.(*cache.ResourceObject)
+		if rpod.Kind != cache.ProjectKind {
+			s.resources.Indexer.DeleteResourceObject(rpod)
 		}
 	}
 	return nil
 }
 
-// This function checks if a project needs to wake up and if so, takes the actions to do that
+// wakeProject checks if a project needs to wake up and if so, takes the actions to do that
 func (s *Sleeper) wakeProject(project *cache.ResourceObject) error {
 	namespace := project.Namespace
 	if s.config.DryRun {
@@ -280,11 +247,10 @@ func (s *Sleeper) wakeProject(project *cache.ResourceObject) error {
 				failed = true
 				glog.Errorf("Force-sleeper: Error removing project( %s )sleep time annotation: %s", namespace, err)
 			}
-			glog.V(2).Infof("Force-sleeper: Adding project( %s )Idled-At annotations", namespace)
-			err = idling.AddProjectIdledAtAnnotation(s.resources, namespace, nowTime, s.config.ProjectSleepPeriod)
+			glog.V(2).Infof("Force-sleeper: Idling services in project( %s )", namespace)
+			err = idling.IdleProject(s.resources, namespace)
 			if err != nil {
-				failed = true
-				glog.Errorf("Force-sleeper: Error applying project idled-at service annotations: %s", err)
+				glog.V(2).Infof("Force-sleeper: Error idling services in project( %s )", namespace)
 			}
 		} else {
 			err := s.SetDryRunResourceRuntimes(namespace)
@@ -327,22 +293,22 @@ func (s *Sleeper) memoryQuota(pod *cache.ResourceObject) resource.Quantity {
 
 }
 
-// Modify all ResourceObjects' cached runtimes when removing force-sleep
+// Modify all pods' cached runtimes when removing force-sleep
 // when running with Dry Run mode enabled, to better simulate real run times
 // (since in Dry Run mode, no resources are actually scaled or deleted with force-sleep)
 func (s *Sleeper) SetDryRunResourceRuntimes(namespace string) error {
 	glog.V(2).Infof("Force-sleeper DryRun: Simulating resource runtimes for namespace( %s ).", namespace)
-	resources, err := s.resources.Indexer.ByIndex("byNamespace", namespace)
+	pods, err := s.resources.Indexer.ByIndex("byNamespace", namespace)
 	if err != nil {
 		return fmt.Errorf("Force-sleeper: %s", err)
 	}
 	for _, resource := range resources {
 		r := resource.(*cache.ResourceObject)
-		copy, err := cache.Scheme.DeepCopy(r)
+		rescopy, err := cache.Scheme.DeepCopy(r)
 		if err != nil {
 			return fmt.Errorf("Force-sleeper: %s", err)
 		}
-		resource := copy.(*cache.ResourceObject)
+		resource := rescopy.(*cache.ResourceObject)
 
 		// If a resource is currently running, remove all its previous runtimes (simulating
 		// applied force-sleep) and set its most recent start time to now (simulating wakeup)
@@ -362,10 +328,7 @@ func (s *Sleeper) SetDryRunResourceRuntimes(namespace string) error {
 
 // Syncs a project and determines if force-sleep is needed
 func (s *Sleeper) syncProject(namespace string) error {
-	if s.config.Exclude[namespace] {
-		return nil
-	}
-
+	idlerInterface := c.IdlerClient.Idlers(namespace)
 	glog.V(2).Infof("Force-sleeper: Syncing project( %s )", namespace)
 	project, err := s.resources.GetProject(namespace)
 	if err != nil {

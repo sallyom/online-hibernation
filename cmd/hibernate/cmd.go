@@ -10,7 +10,7 @@ import (
 
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	"github.com/openshift/online-hibernation/pkg/cache"
-	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
+	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned"
 	"github.com/openshift/online-hibernation/pkg/forcesleep"
 	"github.com/openshift/online-hibernation/pkg/idling"
 	"github.com/prometheus/client_golang/api/prometheus"
@@ -131,9 +131,17 @@ func main() {
 	restMapper := discovery.NewDeferredDiscoveryRESTMapper(cachedDiscovery, apimeta.InterfacesForUnstructured)
 	restMapper.Reset()
 
-	//Cache is a shared object that both Sleeper and Idler will hold a reference to and interact with
-	cache := cache.NewCache(osClient, kubeClient, idlerClient, restConfig, restMapper)
-	cache.Run(c)
+	//projpodCache is a shared object that both Sleeper and Idler will hold a reference to and interact with pods
+	projpodCache := cache.NewProjPodCache(kubeClient, osClient, idlerClient, restConfig, restMapper)
+	projpodCache.Run(c)
+
+	//svcCache is a shared object that both Sleeper and Idler will hold a reference to and interact with services
+	svcCache := cache.NewSvcCache(kubeClient, restConfig, restMapper)
+	svcCache.Run(c)
+
+	//scalablesCache is a shared object that both Sleeper and Idler will hold a reference to and interact with scalable resources
+	scalablesCache := cache.NewScalablesCache(osClient, kubeClient, restConfig, restMapper)
+	scalablesCache.Run(c)
 
 	sleeperConfig := &forcesleep.SleeperConfig{
 		Quota:              quota,
@@ -147,7 +155,7 @@ func main() {
 		QuotaClient:        kubeClient.CoreV1(),
 	}
 
-	sleeper := forcesleep.NewSleeper(sleeperConfig, cache)
+	sleeper := forcesleep.NewSleeper(sleeperConfig, projpodCache)
 
 	// Spawn metrics server and pprof endpoints
 	go func() {
@@ -190,7 +198,7 @@ func main() {
 		ProjectSleepPeriod: projectSleepPeriod,
 	}
 
-	idler := idling.NewAutoIdler(autoIdlerConfig, cache)
+	idler := idling.NewAutoIdler(autoIdlerConfig, projpodCache)
 	idler.Run(c)
 	<-c
 }

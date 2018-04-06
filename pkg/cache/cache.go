@@ -3,20 +3,19 @@ package cache
 import (
 	"fmt"
 
-	"github.com/golang/glog"
 	"github.com/openshift/api/apps/v1"
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	appsv1 "github.com/openshift/client-go/apps/clientset/versioned/typed/apps/v1"
-	iclient "github.com/openshift/origin-idler/pkg/client/clientset/versioned"
+	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
+	//svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 	"k8s.io/api/extensions/v1beta1"
 	extkclientv1beta1 "k8s.io/client-go/kubernetes/typed/extensions/v1beta1"
 
 	corev1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
@@ -34,8 +33,8 @@ var Scheme = runtime.NewScheme()
 var Codecs = serializer.NewCodecFactory(Scheme)
 
 func init() {
-	kscheme.AddToScheme(Scheme)
-	appsscheme.AddToScheme(Scheme)
+       kscheme.AddToScheme(Scheme)
+       appsscheme.AddToScheme(Scheme)
 }
 
 const (
@@ -51,14 +50,7 @@ const (
 	BuildAnnotation       = "openshift.io/build.name"
 )
 
-type ResourceIndexer interface {
-	kcache.Indexer
-	UpdateResourceObject(obj *ResourceObject) error
-	DeleteResourceObject(obj *ResourceObject) error
-	AddResourceObject(obj *ResourceObject) error
-}
-
-type Cache struct {
+type ProjPodCache struct {
 	Indexer     ResourceIndexer
 	OsClient    osclient.Interface
 	KubeClient  kclient.Interface
@@ -68,10 +60,10 @@ type Cache struct {
 	stopChan    <-chan struct{}
 }
 
-func NewCache(osClient osclient.Interface, kubeClient kclient.Interface, config *restclient.Config, mapper apimeta.RESTMapper) *Cache {
-	return &Cache{
-		Indexer:     NewResourceStore(osClient, kubeClient),
-		OsClient:    osClient,
+func NewProjPodCache(osclient osclient.Interface, kubeClient kclient.Interface, idlerClient iclient.IdlersGetter, config *restclient.Config, mapper apimeta.RESTMapper) *ProjPodCache {
+	return &ProjPodCache{
+		Indexer:	 NewResourceStore(osclient, kubeClient),
+		OsClient:	 osclient,
 		KubeClient:  kubeClient,
 		IdlerClient: idlerClient,
 		Config:      config,
@@ -79,70 +71,123 @@ func NewCache(osClient osclient.Interface, kubeClient kclient.Interface, config 
 	}
 }
 
-func (c *Cache) Run(stopChan <-chan struct{}) {
-	c.stopChan = stopChan
+func (projpodc *ProjPodCache) Run(stopChan <-chan struct{}) {
+	projpodc.stopChan = stopChan
+	nsLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return projpodc.KubeClient.CoreV1().Namespaces().List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return projpodc.KubeClient.CoreV1().Namespaces().Watch(options)
+		},
+	}
+	go kcache.NewReflector(nsLW, &corev1.Namespace{}, projpodc.Indexer, 0).Run(projpodc.stopChan)
 
-	//Call to watch for incoming events
-	c.SetUpIndexer()
+	podLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return projpodc.KubeClient.CoreV1().Pods(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return projpodc.KubeClient.CoreV1().Pods(metav1.NamespaceAll).Watch(options)
+		},
+	}
+	go kcache.NewReflector(podLW, &corev1.Pod{}, projpodc.Indexer, 0).Run(projpodc.stopChan)
+
+	projpodc.stopChan = stopChan
 }
 
-func (c *Cache) GetProjectServices(namespace string) ([]interface{}, error) {
-	namespaceAndKind := namespace + "/" + ServiceKind
-	svcs, err := c.Indexer.ByIndex("byNamespaceAndKind", namespaceAndKind)
-	if err != nil {
-		return nil, err
-	}
-	return svcs, nil
+
+type SvcCache struct {
+	KubeClient  kclient.Interface
+	Config      *restclient.Config
+	RESTMapper  apimeta.RESTMapper
+	stopChan    <-chan struct{}
 }
 
-func (c *Cache) GetProjectPods(namespace string) ([]interface{}, error) {
-	namespaceAndKind := namespace + "/" + PodKind
-	pods, err := c.Indexer.ByIndex("byNamespaceAndKind", namespaceAndKind)
-	if err != nil {
-		return nil, err
+func NewSvcCache(kubeClient kclient.Interface, config *restclient.Config, mapper apimeta.RESTMapper) *SvcCache {
+	return &SvcCache{
+		KubeClient:  kubeClient,
+		Config:      config,
+		RESTMapper:  mapper,
 	}
-	return pods, nil
 }
 
-func (c *Cache) GetProject(namespace string) (*ResourceObject, error) {
-	projObj, err := c.Indexer.ByIndex("getProject", namespace)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't get project resources: %v", err)
+func (svcc *SvcCache) Run(stopChan <-chan struct{}) {
+	svcc.stopChan = stopChan
+	svcStore := kcache.NewStore(kcache.MetaNamespaceKeyFunc)
+	svcLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return svcc.KubeClient.CoreV1().Services(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return svcc.KubeClient.CoreV1().Services(metav1.NamespaceAll).Watch(options)
+		},
 	}
-	if e, a := 1, len(projObj); e != a {
-		return nil, fmt.Errorf("expected %d project named %s, got %d", e, namespace, a)
-	}
-
-	project := projObj[0].(*ResourceObject)
-	return project, nil
+	go kcache.NewReflector(svcLW, &corev1.Service{}, svcStore, 0).Run(svcc.stopChan)
 }
 
-// Takes in a list of locally cached Pod ResourceObjects and a Service ResourceObject
-// Compares selector labels on the pods and services to check for any matches which link the two
-// Pod label must match service selector to link the two
-// TODO: Best way to find pods for service?
-func (c *Cache) GetPodsForService(svc *ResourceObject, podList []interface{}) map[string]runtime.Object {
-	pods := make(map[string]runtime.Object)
-	for _, obj := range podList {
-		pod := obj.(*ResourceObject)
-		if svc.Selectors.Matches(labels.Set(pod.Labels)) {
-			podRef, err := c.KubeClient.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
-			if err != nil {
-				// This may fail when a pod has been deleted but not yet pruned from cache
-				// glog.Errorf?
-				glog.V(3).Infof("Project( %s ): %s, continuing...\n", pod.Namespace, err)
-				continue
-			}
-			pods[pod.Name] = podRef
-		}
+type ScalablesCache struct {
+	ScalablesStore kcache.Store
+	OsClient    osclient.Interface
+	KubeClient  kclient.Interface
+	Config      *restclient.Config
+	RESTMapper  apimeta.RESTMapper
+	stopChan    <-chan struct{}
+}
+
+func NewScalablesCache(kubeClient kclient.Interface, config *restclient.Config, mapper apimeta.RESTMapper) *ScalablesCache {
+	return &ScalablesCache{
+		ScalablesStore: kcache.NewStore(kcache.MetaNamespaceKeyFunc),
+		KubeClient:  kubeClient,
+		Config:      config,
+		RESTMapper:  mapper,
 	}
-	return pods
+}
+
+func (scalablesc *ScalablesCache) Run(stopChan <-chan struct{}) {
+	scalablesc.stopChan = stopChan
+	scalablesc.ScalablesListWatchReflect()
+}
+
+func (c *ScalablesCache) ScalablesListWatchReflect() {
+	rcLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.KubeClient.CoreV1().ReplicationControllers(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.KubeClient.CoreV1().ReplicationControllers(metav1.NamespaceAll).Watch(options)
+		},
+	}
+	rcr := kcache.NewReflector(rcLW, &corev1.ReplicationController{}, c.ScalablesStore, 0)
+	go rcr.Run(c.stopChan)
+
+	rsLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.KubeClient.ExtensionsV1beta1().ReplicaSets(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.KubeClient.ExtensionsV1beta1().ReplicaSets(metav1.NamespaceAll).Watch(options)
+		},
+	}
+	rsr := kcache.NewReflector(rsLW, &v1beta1.ReplicaSet{}, c.ScalablesStore, 0)
+	go rsr.Run(c.stopChan)
+
+		ssLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return c.KubeClient.AppsV1beta1().StatefulSets(metav1.NamespaceAll).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return c.KubeClient.AppsV1beta1().StatefulSets(metav1.NamespaceAll).Watch(options)
+		},
+	}
+	ssr := kcache.NewReflector(ssLW, &appsv1beta1.StatefulSet{}, c.ScalablesStore, 0)
+	go ssr.Run(c.stopChan)
 }
 
 // Takes a list of Pods and looks at their parent controllers
 // Then takes that list of parent controllers and checks if there is another parent above them
 // ex. pod -> RC -> DC, DC is the main parent controller we want to idle
-func (c *Cache) FindScalableResourcesForService(pods map[string]runtime.Object) (map[corev1.ObjectReference]struct{}, error) {
+func (c *ProjPodCache) FindScalableResourcesForService(pods map[string]runtime.Object) (map[corev1.ObjectReference]struct{}, error) {
 	immediateControllerRefs := make(map[corev1.ObjectReference]struct{})
 	for _, pod := range pods {
 		controllerRef, err := GetControllerRef(pod)
@@ -265,104 +310,15 @@ func GetController(ref corev1.ObjectReference, restMapper apimeta.RESTMapper, re
 	return result, nil
 }
 
-func (c *Cache) GetAndCopyEndpoint(namespace, name string) (*corev1.Endpoints, error) {
-	endpointInterface := c.KubeClient.CoreV1().Endpoints(namespace)
-	endpoint, err := endpointInterface.Get(name, metav1.GetOptions{})
+func (c *ProjPodCache) GetProject(namespace string) (*ResourceObject, error) {
+	projObj, err := c.Indexer.ByIndex("getProject", namespace)
 	if err != nil {
-		if !kerrors.IsNotFound(err) {
-			return nil, fmt.Errorf("Error getting endpoint in namespace( %s ): %s", namespace, err)
-		}
+		return nil, fmt.Errorf("couldn't get project resources: %v", err)
 	}
-	copy, err := Scheme.DeepCopy(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("Error copying endpoint in namespace( %s ): %s", namespace, err)
+	if e, a := 1, len(projObj); e != a {
+		return nil, fmt.Errorf("expected %d project named %s, got %d", e, namespace, a)
 	}
-	newEndpoint := copy.(*corev1.Endpoints)
 
-	if newEndpoint.Annotations == nil {
-		newEndpoint.Annotations = make(map[string]string)
-	}
-	return newEndpoint, nil
-}
-
-// Keying functions for Indexer
-func indexResourceByNamespace(obj interface{}) ([]string, error) {
-	object := obj.(*ResourceObject)
-	return []string{object.Namespace}, nil
-}
-
-func getProjectResource(obj interface{}) ([]string, error) {
-	object := obj.(*ResourceObject)
-	if object.Kind == ProjectKind {
-		return []string{object.Name}, nil
-	}
-	return []string{}, nil
-}
-
-func getAllResourcesOfKind(obj interface{}) ([]string, error) {
-	object := obj.(*ResourceObject)
-	return []string{object.Kind}, nil
-}
-
-func indexResourceByNamespaceAndKind(obj interface{}) ([]string, error) {
-	object := obj.(*ResourceObject)
-	fullName := object.Namespace + "/" + object.Kind
-	return []string{fullName}, nil
-}
-
-func (c *Cache) SetUpIndexer() {
-	podLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return c.KubeClient.CoreV1().Pods(metav1.NamespaceAll).List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return c.KubeClient.CoreV1().Pods(metav1.NamespaceAll).Watch(options)
-		},
-	}
-	podr := kcache.NewReflector(podLW, &corev1.Pod{}, c.Indexer, 0)
-	go podr.Run(c.stopChan)
-
-	rcLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return c.KubeClient.CoreV1().ReplicationControllers(metav1.NamespaceAll).List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return c.KubeClient.CoreV1().ReplicationControllers(metav1.NamespaceAll).Watch(options)
-		},
-	}
-	rcr := kcache.NewReflector(rcLW, &corev1.ReplicationController{}, c.Indexer, 0)
-	go rcr.Run(c.stopChan)
-
-	rsLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return c.KubeClient.ExtensionsV1beta1().ReplicaSets(metav1.NamespaceAll).List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return c.KubeClient.ExtensionsV1beta1().ReplicaSets(metav1.NamespaceAll).Watch(options)
-		},
-	}
-	rsr := kcache.NewReflector(rsLW, &v1beta1.ReplicaSet{}, c.Indexer, 0)
-	go rsr.Run(c.stopChan)
-
-	svcLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return c.KubeClient.CoreV1().Services(metav1.NamespaceAll).List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return c.KubeClient.CoreV1().Services(metav1.NamespaceAll).Watch(options)
-		},
-	}
-	svcr := kcache.NewReflector(svcLW, &corev1.Service{}, c.Indexer, 0)
-	go svcr.Run(c.stopChan)
-
-	projLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return c.KubeClient.CoreV1().Namespaces().List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return c.KubeClient.CoreV1().Namespaces().Watch(options)
-		},
-	}
-	projr := kcache.NewReflector(projLW, &corev1.Namespace{}, c.Indexer, 0)
-	go projr.Run(c.stopChan)
+	project := projObj[0].(*ResourceObject)
+	return project, nil
 }
