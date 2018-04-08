@@ -50,39 +50,25 @@ const (
 	BuildAnnotation       = "openshift.io/build.name"
 )
 
-type ProjPodCache struct {
+type PodCache struct {
 	Indexer     ResourceIndexer
-	OsClient    osclient.Interface
 	KubeClient  kclient.Interface
-	IdlerClient iclient.IdlersGetter
 	Config      *restclient.Config
 	RESTMapper  apimeta.RESTMapper
 	stopChan    <-chan struct{}
 }
 
-func NewProjPodCache(osclient osclient.Interface, kubeClient kclient.Interface, idlerClient iclient.IdlersGetter, config *restclient.Config, mapper apimeta.RESTMapper) *ProjPodCache {
-	return &ProjPodCache{
+func NewPodCache(kubeClient kclient.Interface, config *restclient.Config, mapper apimeta.RESTMapper) *PodCache {
+	return &PodCache{
 		Indexer:	 NewResourceStore(osclient, kubeClient),
-		OsClient:	 osclient,
 		KubeClient:  kubeClient,
-		IdlerClient: idlerClient,
 		Config:      config,
 		RESTMapper:  mapper,
 	}
 }
 
-func (projpodc *ProjPodCache) Run(stopChan <-chan struct{}) {
-	projpodc.stopChan = stopChan
-	nsLW := &kcache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
-			return projpodc.KubeClient.CoreV1().Namespaces().List(options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
-			return projpodc.KubeClient.CoreV1().Namespaces().Watch(options)
-		},
-	}
-	go kcache.NewReflector(nsLW, &corev1.Namespace{}, projpodc.Indexer, 0).Run(projpodc.stopChan)
-
+func (podc *PodCache) Run(stopChan <-chan struct{}) {
+	podc.stopChan = stopChan
 	podLW := &kcache.ListWatch{
 		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
 			return projpodc.KubeClient.CoreV1().Pods(metav1.NamespaceAll).List(options)
@@ -91,11 +77,42 @@ func (projpodc *ProjPodCache) Run(stopChan <-chan struct{}) {
 			return projpodc.KubeClient.CoreV1().Pods(metav1.NamespaceAll).Watch(options)
 		},
 	}
-	go kcache.NewReflector(podLW, &corev1.Pod{}, projpodc.Indexer, 0).Run(projpodc.stopChan)
+	go kcache.NewReflector(podLW, &corev1.Pod{}, podc.Indexer, 0).Run(podc.stopChan)
 
-	projpodc.stopChan = stopChan
+	podc.stopChan = stopChan
 }
 
+type ProjectCache struct {
+	OsClient    osclient.Interface
+	KubeClient  kclient.Interface
+	Config      *restclient.Config
+	RESTMapper  apimeta.RESTMapper
+	stopChan    <-chan struct{}
+}
+
+func NewProjectCache(kubeClient kclient.Interface,  config *restclient.Config, mapper apimeta.RESTMapper) *ProjectCache {
+	return &ProjectCache{
+		KubeClient:  kubeClient,
+		Config:      config,
+		RESTMapper:  mapper,
+	}
+}
+
+func (projc *ProjectCache) Run(stopChan <-chan struct{}) {
+	projc.stopChan = stopChan
+	projStore := kcache.NewStore(kcache.MetaNamespaceKeyFunc)
+	nsLW := &kcache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			return projc.KubeClient.CoreV1().Namespaces().List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			return projc.KubeClient.CoreV1().Namespaces().Watch(options)
+		},
+	}
+	go kcache.NewReflector(nsLW, &corev1.Namespace{}, projStore, 0).Run(projc.stopChan)
+
+	projc.stopChan = stopChan
+}
 
 type SvcCache struct {
 	KubeClient  kclient.Interface
@@ -128,7 +145,6 @@ func (svcc *SvcCache) Run(stopChan <-chan struct{}) {
 
 type ScalablesCache struct {
 	ScalablesStore kcache.Store
-	OsClient    osclient.Interface
 	KubeClient  kclient.Interface
 	Config      *restclient.Config
 	RESTMapper  apimeta.RESTMapper
@@ -187,7 +203,7 @@ func (c *ScalablesCache) ScalablesListWatchReflect() {
 // Takes a list of Pods and looks at their parent controllers
 // Then takes that list of parent controllers and checks if there is another parent above them
 // ex. pod -> RC -> DC, DC is the main parent controller we want to idle
-func (c *ProjPodCache) FindScalableResourcesForService(pods map[string]runtime.Object) (map[corev1.ObjectReference]struct{}, error) {
+func (c *ScalablesCache) FindScalableResourcesForService(pods map[string]runtime.Object) (map[corev1.ObjectReference]struct{}, error) {
 	immediateControllerRefs := make(map[corev1.ObjectReference]struct{})
 	for _, pod := range pods {
 		controllerRef, err := GetControllerRef(pod)
@@ -310,7 +326,15 @@ func GetController(ref corev1.ObjectReference, restMapper apimeta.RESTMapper, re
 	return result, nil
 }
 
-func (c *ProjPodCache) GetProject(namespace string) (*ResourceObject, error) {
+func (c *ProjectCache) RemoveProjectsFromCacheWithoutHibernationLabel() {
+	allprojs := c.Store.List()
+	for p, range allprojs {
+		if p.Labels == nil {
+			c.store.Delete(p)
+		} else {
+			if p.Annotations[
+			// FINISH THAT ^^
+func (c *PodCache) GetProject(namespace string) (*ResourceObject, error) {
 	projObj, err := c.Indexer.ByIndex("getProject", namespace)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't get project resources: %v", err)
@@ -321,4 +345,13 @@ func (c *ProjPodCache) GetProject(namespace string) (*ResourceObject, error) {
 
 	project := projObj[0].(*ResourceObject)
 	return project, nil
+}
+
+func (c *PodCache) GetProjectPods(namespace string) ([]interface{}, error) {
+	namespaceAndKind := namespace + "/" + PodKind
+	pods, err := c.Indexer.ByIndex("byNamespaceAndKind", namespaceAndKind)
+	if err != nil {
+		return nil, err
+	}
+	return pods, nil
 }

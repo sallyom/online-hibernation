@@ -41,14 +41,10 @@ type ResourceObject struct {
 	ResourceVersion   string
 	RunningTimes      []*RunningTime
 	MemoryRequested   resource.Quantity
-	LastSleepTime     time.Time
-	ProjectSortIndex  float64
 	DeletionTimestamp time.Time
 	Selectors         labels.Selector
 	Labels            map[string]string
 	Annotations       map[string]string
-	IsAsleep          bool
-	Idler			  svcidler.Idler
 }
 
 
@@ -69,7 +65,6 @@ type ResourceIndexer interface {
 type resourceStore struct {
 	mu sync.RWMutex
 	kcache.Indexer
-	OsClient   osclient.Interface
 	KubeClient kclient.Interface
 }
 
@@ -77,15 +72,15 @@ func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*Resourc
 	switch r := resource.(type) {
 	case *corev1.Pod:
 		return s.NewResourceFromPod(r), nil
-	case *corev1.Namespace:
-		labels := r.GetLabels()
-		if include, ok := labels[HibernationLabel]; ok && include == "true" {
-			return s.NewResourceFromProject(r), nil
-		} else {
-			glog.V(2).Infof("Excluding namespace( %s )from hibernation, label( %s=true )not found.", r.Name, HibernationLabel)
-			return nil, nil
-		}
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	//case *corev1.Namespace:
+	//	labels := r.GetLabels()
+	//	if include, ok := labels[HibernationLabel]; ok && include == "true" {
+	//		return s.NewResourceFromProject(r), nil
+	//	} else {
+	//		glog.V(2).Infof("Excluding namespace( %s )from hibernation, label( %s=true )not found.", r.Name, HibernationLabel)
+	//		return nil, nil
+	//	}
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil, nil
 	}
 	return nil, fmt.Errorf("unknown resource of type %T", resource)
@@ -173,7 +168,7 @@ func (s *resourceStore) stopResource(r *ResourceObject) {
 
 func (s *resourceStore) AddOrModify(obj interface{}) error {
 	switch r := obj.(type) {
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil
 	case *corev1.Pod:
 		resObj, err := s.NewResourceFromInterface(obj.(*corev1.Pod))
@@ -192,42 +187,6 @@ func (s *resourceStore) AddOrModify(obj interface{}) error {
 		case corev1.PodSucceeded, corev1.PodFailed, corev1.PodUnknown:
 			s.stopResource(resObj)
 		}
-	case *corev1.Namespace:
-		resObj, err := s.NewResourceFromInterface(obj.(*corev1.Namespace))
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		glog.V(3).Infof("Received ADD/MODIFY for Project: %s\n", r.Name)
-		if r.Status.Phase == corev1.NamespaceActive {
-			_, exists, err := s.GetResourceByKey(r.Name)
-			if err != nil {
-				glog.Errorf("Error: %v", err)
-			}
-			if !exists {
-				resObj := s.NewResourceFromProject(r)
-				s.Indexer.Add(resObj)
-			}
-		}
-		// Now make sure it was added
-		UID := string(resObj.UID)
-		obj, exists, err := s.GetResourceByKey(UID)
-		if err != nil {
-			return err
-		}
-		if exists {
-			objCopy := obj.DeepCopy()
-			if err != nil {
-				return err
-			}
-			return s.Indexer.Update(objCopy)
-		} else {
-			if r.Status.Phase == corev1.NamespaceActive {
-				glog.Errorf("Project not in cache")
-			}
-		}
 	default:
 		glog.Errorf("Object not recognized")
 	}
@@ -237,7 +196,7 @@ func (s *resourceStore) AddOrModify(obj interface{}) error {
 func (s *resourceStore) DeleteKapiResource(obj interface{}) error {
 	glog.V(3).Infof("Received DELETE event\n")
 	switch r := obj.(type) {
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil
 	case *corev1.Pod:
 		resObj, err := s.NewResourceFromInterface(r)
@@ -251,25 +210,6 @@ func (s *resourceStore) DeleteKapiResource(obj interface{}) error {
 		if s.ResourceInCache(UID) {
 			s.stopResource(resObj)
 		}
-	case *corev1.Namespace:
-		resObj, err := s.NewResourceFromInterface(r)
-		if err != nil {
-			return err
-		}
-		if resObj == nil {
-			return nil
-		}
-		// Get all resources from a deleted namespace and remove them from the cache
-		resources, err := s.Indexer.ByIndex("byNamespace", resObj.Name)
-		if err != nil {
-			return err
-		}
-		for _, res := range resources {
-			r := res.(*ResourceObject)
-			if err := s.Indexer.Delete(r); err != nil {
-				return err
-			}
-		}
 	default:
 		glog.V(3).Infof("Object not recognized, Could not delete object")
 	}
@@ -280,9 +220,9 @@ func (s *resourceStore) Add(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch r := obj.(type) {
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil
-	case *corev1.Namespace, *corev1.Pod:
+	case *corev1.Pod:
 		if err := s.AddOrModify(r); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -296,9 +236,9 @@ func (s *resourceStore) Delete(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch obj.(type) {
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil
-	case *corev1.Namespace, *corev1.Pod:
+	case *corev1.Pod:
 		if err := s.DeleteKapiResource(obj); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -312,9 +252,9 @@ func (s *resourceStore) Update(obj interface{}) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch r := obj.(type) {
-	case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil
-	case *corev1.Namespace, *corev1.Pod:
+	case *corev1.Pod:
 		if err := s.AddOrModify(r); err != nil {
 			return fmt.Errorf("Error: %s", err)
 		}
@@ -345,17 +285,6 @@ func (s *resourceStore) DeleteResourceObject(obj *ResourceObject) error {
 		if s.ResourceInCache(UID) {
 			// Should this be stopResource?
 			s.Indexer.Delete(obj)
-		}
-	case ProjectKind:
-		resources, err := s.Indexer.ByIndex("byNamespace", obj.Name)
-		if err != nil {
-			return err
-		}
-		for _, res := range resources {
-			r := res.(*ResourceObject)
-			if err := s.Indexer.Delete(r); err != nil {
-				return err
-			}
 		}
 	default:
 		glog.Errorf("Object not recognized")
@@ -422,9 +351,9 @@ func (s *resourceStore) Replace(objs []interface{}, resVer string) error {
 	s.Indexer.Replace(objsToSave, resVer)
 	for _, obj := range objs {
 		switch r := obj.(type) {
-		case *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
+		case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 			return nil
-		case *corev1.Namespace, *corev1.Pod:
+		case *corev1.Pod:
 			if err := s.AddOrModify(r); err != nil {
 				return err
 			}
@@ -493,12 +422,11 @@ func (s *resourceStore) AddIndexers(newIndexers kcache.Indexers) error {
 }
 
 // NewResourceStore creates an Indexer store with the given key function
-func NewResourceStore(osClient osclient.Interface, kubeClient kclient.Interface) *resourceStore {
+func NewResourceStore(kubeClient kclient.Interface) *resourceStore {
 	store := &resourceStore{
 		Indexer: kcache.NewIndexer(resourceKey, kcache.Indexers{
 			"byNamespace":        indexResourceByNamespace,
 			"byNamespaceAndKind": indexResourceByNamespaceAndKind,
-			"getProject":         getProjectResource,
 			"ofKind":             getAllResourcesOfKind,
 		}),
 		OsClient:   osClient,
@@ -513,14 +441,6 @@ func NewResourceStore(osClient osclient.Interface, kubeClient kclient.Interface)
 func indexResourceByNamespace(obj interface{}) ([]string, error) {
 	object := obj.(*ResourceObject)
 	return []string{object.Namespace}, nil
-}
-
-func getProjectResource(obj interface{}) ([]string, error) {
-	object := obj.(*ResourceObject)
-	if object.Kind == ProjectKind {
-		return []string{object.Name}, nil
-	}
-	return []string{}, nil
 }
 
 func getAllResourcesOfKind(obj interface{}) ([]string, error) {
@@ -567,13 +487,10 @@ func (in *ResourceObject) DeepCopyInto(out *ResourceObject) {
 	out.RunningTimes = in.RunningTimes
 	out.MemoryRequested = in.MemoryRequested
 	out.LastSleepTime = in.LastSleepTime
-	out.ProjectSortIndex = in.ProjectSortIndex
 	out.DeletionTimestamp = in.DeletionTimestamp
 	out.Selectors = in.Selectors
 	out.Labels = in.Labels
 	out.Annotations = in.Annotations
-	out.IsAsleep = in.IsAsleep
-	out.Idler = in.Idler
 	return
 }
 
@@ -669,18 +586,10 @@ func (s *resourceStore) NewResourceFromPod(pod *corev1.Pod) *ResourceObject {
 	return resource
 }
 
-func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *ResourceObject {
-	resource := &ResourceObject{
-		UID:              types.UID(namespace.Name),
-		Name:             namespace.Name,
-		Namespace:        namespace.Name,
-		Kind:             ProjectKind,
-		LastSleepTime:    time.Time{},
-		ProjectSortIndex: 0.0,
-		IsAsleep:         false,
-		Idler:            svcidler.Idler{},
-	}
-
+//Take proj in cache and place hibernation annotations
+//Also, delete proj in cache if it does not have hibernation label
+func ProcessHibernationAnnotationsForProject(namespace *corev1.Namespace) {
+	projCopy, err := proj.DeepCopy()
 	// Parse any LastSleepTime annotation on the namespace
 	if namespace.ObjectMeta.Annotations != nil {
 		if namespace.ObjectMeta.Annotations[LastSleepTimeAnnotation] != "" {
@@ -690,9 +599,9 @@ func (s *resourceStore) NewResourceFromProject(namespace *corev1.Namespace) *Res
 				parsedTime = s.getParsedTimeFromQuotaCreation(namespace)
 				glog.Errorf("Error parsing project LastSleepTime annotation on namespace: %v", err)
 			}
-			resource.LastSleepTime = parsedTime
+			// Not sure if this is necessary
 			if !parsedTime.IsZero() {
-				resource.IsAsleep = true
+				projCopy.Annotations[IsAsleepAnnotation] == "true"
 			}
 		}
 	}

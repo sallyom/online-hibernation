@@ -10,7 +10,7 @@ import (
 
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	"github.com/openshift/online-hibernation/pkg/cache"
-	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned"
+	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
 	"github.com/openshift/online-hibernation/pkg/forcesleep"
 	"github.com/openshift/online-hibernation/pkg/idling"
 	"github.com/prometheus/client_golang/api/prometheus"
@@ -26,13 +26,13 @@ import (
 	restclient "k8s.io/client-go/rest"
 )
 
-func createClients() (*restclient.Config, kclient.Interface, iclient.Interface, error) {
+func createClients() (*restclient.Config, kclient.Interface, iclient.IdlersGetter, error) {
 	return CreateClientsForConfig()
 }
 
 // CreateClientsForConfig creates and returns OpenShift and Kubernetes clients (as well as other useful
 // client objects) for the given client config.
-func CreateClientsForConfig() (*restclient.Config, kclient.Interface, iclient.Interface, error) {
+func CreateClientsForConfig() (*restclient.Config, kclient.Interface, iclient.IdlersGetter, error) {
 
 	clientConfig, err := restclient.InClusterConfig()
 	if err != nil {
@@ -99,7 +99,7 @@ func main() {
 	}
 
 	//Set up clients
-	restConfig, kubeClient, idlerClient, err := createClients()
+	restConfig, kubeClient, idlersClient, err := createClients()
 	osClient := osclient.NewForConfigOrDie(restConfig)
 	var prometheusClient prometheus.Client
 
@@ -131,16 +131,20 @@ func main() {
 	restMapper := discovery.NewDeferredDiscoveryRESTMapper(cachedDiscovery, apimeta.InterfacesForUnstructured)
 	restMapper.Reset()
 
-	//projpodCache is a shared object that both Sleeper and Idler will hold a reference to and interact with pods
-	projpodCache := cache.NewProjPodCache(kubeClient, osClient, idlerClient, restConfig, restMapper)
-	projpodCache.Run(c)
+	//projCache is a shared object that both Sleeper and Idler will hold a reference to and interact with pods
+	projCache := cache.NewProjectCache(kubeClient, restConfig, restMapper)
+	projCache.Run(c)
+
+	//podCache is a shared object that both Sleeper and Idler will hold a reference to and interact with pods
+	podCache := cache.NewPodCache(kubeClient, restConfig, restMapper)
+	podCache.Run(c)
 
 	//svcCache is a shared object that both Sleeper and Idler will hold a reference to and interact with services
 	svcCache := cache.NewSvcCache(kubeClient, restConfig, restMapper)
 	svcCache.Run(c)
 
 	//scalablesCache is a shared object that both Sleeper and Idler will hold a reference to and interact with scalable resources
-	scalablesCache := cache.NewScalablesCache(osClient, kubeClient, restConfig, restMapper)
+	scalablesCache := cache.NewScalablesCache(kubeClient, restConfig, restMapper)
 	scalablesCache.Run(c)
 
 	sleeperConfig := &forcesleep.SleeperConfig{
@@ -153,9 +157,10 @@ func main() {
 		NonTermQuota:       ntQuota,
 		DryRun:             sleepDryRun,
 		QuotaClient:        kubeClient.CoreV1(),
+		IdlersClient:	    idlersClient,
 	}
 
-	sleeper := forcesleep.NewSleeper(sleeperConfig, projpodCache)
+	sleeper := forcesleep.NewSleeper(sleeperConfig, projCache, podCache)
 
 	// Spawn metrics server and pprof endpoints
 	go func() {
@@ -196,9 +201,10 @@ func main() {
 		Threshold:          threshold,
 		IdleDryRun:         idleDryRun,
 		ProjectSleepPeriod: projectSleepPeriod,
+		IdlersClient:	    idlersClient,
 	}
 
-	idler := idling.NewAutoIdler(autoIdlerConfig, projpodCache)
+	idler := idling.NewAutoIdler(autoIdlerConfig, projCache, podCache)
 	idler.Run(c)
 	<-c
 }

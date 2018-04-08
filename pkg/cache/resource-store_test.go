@@ -267,23 +267,6 @@ func TestProjPodCacheIsInitiallyPopulated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// somens1 should be converted to ResourceObject properly
-	if assert.Len(t, projs, 1, "expected to have one namespace called somens1") {
-		resource := &ResourceObject{
-			UID:       "somens1",
-			Name:      "somens1",
-			Namespace: "somens1",
-			Kind:      ProjectKind,
-		}
-		assert.Equal(t, resource, projs[0], "expected the namespace somens1 to be converted to a resource object properly")
-	}
-
-	// somens2 is Phase: corev1.NamespaceTerminating, so it should not be added to cache
-	projs, err = store.ByIndex("getProject", "somens2")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	assert.Len(t, projs, 0, "somens2 is terminating, did not expect it to be added to cache")
 
 	// somepod1 should be converted to ResourceObject properly
 	pods, err := store.ByIndex("byNamespaceAndKind", "somens1/"+PodKind)
