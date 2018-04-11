@@ -7,17 +7,17 @@ import (
 
 	"github.com/golang/glog"
 
-	osclient "github.com/openshift/client-go/apps/clientset/versioned"
+//	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 
-	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
+	//svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 	//iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
 	appsv1beta1 "k8s.io/api/apps/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	//kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	//metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	kclient "k8s.io/client-go/kubernetes"
@@ -27,6 +27,8 @@ import (
 const (
 	LastSleepTimeAnnotation = "openshift.io/last-sleep-time"
 	HibernationLabel        = "openshift.io/hibernate-include"
+	IsAsleepAnnotation      = "openshift.io/is-asleep"
+	timeform = "2006-01-02 15:04:05.999999999 -0700 MST"
 )
 
 // ResourceObject is a wrapper around PodCache and NamespaceCache, 
@@ -70,18 +72,10 @@ type resourceStore struct {
 
 func (s *resourceStore) NewResourceFromInterface(resource interface{}) (*ResourceObject, error) {
 	switch r := resource.(type) {
-	case *corev1.Pod:
-		return s.NewResourceFromPod(r), nil
-	//case *corev1.Namespace:
-	//	labels := r.GetLabels()
-	//	if include, ok := labels[HibernationLabel]; ok && include == "true" {
-	//		return s.NewResourceFromProject(r), nil
-	//	} else {
-	//		glog.V(2).Infof("Excluding namespace( %s )from hibernation, label( %s=true )not found.", r.Name, HibernationLabel)
-	//		return nil, nil
-	//	}
 	case *corev1.Namespace, *corev1.ReplicationController, *v1beta1.ReplicaSet, *appsv1beta1.StatefulSet, *corev1.Service:
 		return nil, nil
+	case *corev1.Pod:
+		return s.NewResourceFromPod(r), nil
 	}
 	return nil, fmt.Errorf("unknown resource of type %T", resource)
 }
@@ -429,7 +423,6 @@ func NewResourceStore(kubeClient kclient.Interface) *resourceStore {
 			"byNamespaceAndKind": indexResourceByNamespaceAndKind,
 			"ofKind":             getAllResourcesOfKind,
 		}),
-		OsClient:   osClient,
 		KubeClient: kubeClient,
 	}
 	store.mu.Lock()
@@ -486,7 +479,6 @@ func (in *ResourceObject) DeepCopyInto(out *ResourceObject) {
 	out.ResourceVersion = in.ResourceVersion
 	out.RunningTimes = in.RunningTimes
 	out.MemoryRequested = in.MemoryRequested
-	out.LastSleepTime = in.LastSleepTime
 	out.DeletionTimestamp = in.DeletionTimestamp
 	out.Selectors = in.Selectors
 	out.Labels = in.Labels
@@ -584,95 +576,5 @@ func (s *resourceStore) NewResourceFromPod(pod *corev1.Pod) *ResourceObject {
 	}
 
 	return resource
-}
-
-//Take proj in cache and place hibernation annotations
-//Also, delete proj in cache if it does not have hibernation label
-func ProcessHibernationAnnotationsForProject(namespace *corev1.Namespace) {
-	projCopy, err := proj.DeepCopy()
-	// Parse any LastSleepTime annotation on the namespace
-	if namespace.ObjectMeta.Annotations != nil {
-		if namespace.ObjectMeta.Annotations[LastSleepTimeAnnotation] != "" {
-			glog.V(2).Infof("Caching previously-set LastSleepTime for project %s: %+v", namespace.Name, namespace.ObjectMeta.Annotations[LastSleepTimeAnnotation])
-			parsedTime, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", namespace.ObjectMeta.Annotations[LastSleepTimeAnnotation])
-			if err != nil {
-				parsedTime = s.getParsedTimeFromQuotaCreation(namespace)
-				glog.Errorf("Error parsing project LastSleepTime annotation on namespace: %v", err)
-			}
-			// Not sure if this is necessary
-			if !parsedTime.IsZero() {
-				projCopy.Annotations[IsAsleepAnnotation] == "true"
-			}
-		}
-	}
-	// Find any Idlers in the namespace
-    //idlers, err := ic.Idlers(namespace.Name).List(metav1.ListOptions{})
-    //if err != nil {
-    //        glog.Errorf("Error listing Idlers in namespace( %v ): %v", namespace.Name, err)
-    //}
-	//switch {
-	//case len(idlers.Items) > 1:
-    //    glog.V(2).Infof("WHY ARE THERE MORE THAN 1 IDLER IN THIS NAMESPACE?")
-	//case len(idlers.Items) == 0:
-		// Populate and Add an idler to resourceObject, with wantIdle=false
-	//case len(idlers.Items) == 1:
-	//	glog.V(2).Infof("Idler( %v )detected in project( %s ).", idlers.Items[0], namespace)
-	//	resource.Idler = idlers.Items[0]
-	//}
-	return resource
-}
-
-func (s *resourceStore) getParsedTimeFromQuotaCreation(namespace *corev1.Namespace) time.Time {
-	// Try to see if a quota exists and if so, get sleeptime from there
-	// If not, delete the annotation from the namespace object
-	quotaInterface := s.KubeClient.CoreV1().ResourceQuotas(namespace.Name)
-	quota, err := quotaInterface.Get(ProjectSleepQuotaName, metav1.GetOptions{})
-	exists := true
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			exists = false
-		} else {
-			glog.Errorf("Error getting project resource quota: %v", err)
-			return time.Time{}
-		}
-	}
-
-	if exists {
-		parsedTime, err := time.Parse("2006-01-02 15:04:05.999999999 -0700 MST", quota.ObjectMeta.CreationTimestamp.String())
-		if err != nil {
-			glog.Errorf("Error parsing quota creationtimestamp: %v", err)
-		}
-		return parsedTime
-	} else {
-		nsCopy := namespace.DeepCopy()
-		delete(nsCopy.Annotations, LastSleepTimeAnnotation)
-		_, err = s.KubeClient.CoreV1().Namespaces().Update(nsCopy)
-		if err != nil {
-			glog.Errorf("Error deleting project LastSleepTime: %v", err)
-		}
-	}
-	return time.Time{}
-}
-
-// TODO WRITE THIS
-// GetIdlerTargetScalables populates Idler IdlerSpec.TargetScalables
-func (c *ProjPodCache) GetIdlerTargetScalables(namespace string) ([]svcidler.CrossGroupObjectReference, error) {
-	project, err := c.GetProject(namespace)
-	if err != nil {
-		return nil, err
-	}
-	glog.V(2).Infof("Project: %s", project.Name)
-	// Store the scalable resources in a map (this will become an annotation on the service later)
-	targetScalables := []svcidler.CrossGroupObjectReference{}
-	// get some scaleRefs then add them to targetScalables
-	//var scaleRefs []svcidler.CrossGroupObjectReference
-	return targetScalables, nil
-}
-
-// TODO WRITE THIS
-// GetIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
-func GetIdlerTriggerServiceNames(c *SvcCache, namespace string) ([]string, error) {
-	// populate/update Idler.TriggerServiceNames
-	return nil, nil
 }
 
