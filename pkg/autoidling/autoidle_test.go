@@ -1,4 +1,4 @@
-package idling
+package autoidling
 
 import (
 	"log"
@@ -14,18 +14,40 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	kappsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	fakekclientset "k8s.io/client-go/kubernetes/fake"
+	fakescale "k8s.io/client-go/scale/fake"
+	fakedynamic "k8s.io/client-go/dynamic/fake"
 	restclient "k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
+	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 func init() {
 	log.SetOutput(os.Stdout)
+}
+
+// This is copied from cmd.go
+func tweakListOpts(options *metav1.ListOptions) {
+	selectormap := map[string]string{cache.HibernationLabel: "true"}
+	selector, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectormap})
+	labelselector := selector.String()
+	options.LabelSelector = labelselector
+}
+
+func containerListForMemory(memory string)[]metav1.Container {
+	var containerList []metav1.Container
+	quantity := resource.MustParse(memory)
+	limits := make(map[metav1.ResourceName]resource.Quantity)
+	limits["memory"] = quantity
+	container := metav1.Container{Name: "aname", Resources: metav1.ResourceRequirements{Limits: limits}}
+	containerList = append(containerList, aContainer)
+	return containerList
 }
 
 func TestSync(t *testing.T) {
@@ -36,7 +58,10 @@ func TestSync(t *testing.T) {
 		pods                   []*corev1.Pod
 		services               []*corev1.Service
 		replicationControllers []*corev1.ReplicationController
-		resources              []*cache.ResourceObject
+		statefulSets		   []*kappsv1.StatefulSet
+		replicaSets			   []*kappsv1.ReplicaSet
+		deployments			   []*kappsv1.Deployment
+		resources              []*cache.ResourceStore
 		expectedQueueLen       int
 		expectedQueueKeys      []string
 	}{
@@ -44,7 +69,7 @@ func TestSync(t *testing.T) {
 			idleDryRun: false,
 			netmap:     map[string]float64{"somens1": 1000},
 			pods: []*corev1.Pod{
-				pod("somepod1", "somens1"),
+				pod("somepod1", "somens1", corev1.RestartPolicyAlways, nil, containerListForMemory("500Mi"), time.Now().Add(-1*time.Hour), corev1.PodRunning),
 			},
 			services: []*corev1.Service{
 				svc("somesvc1", "somens1"),
@@ -361,7 +386,12 @@ func TestSync(t *testing.T) {
 		}
 		fakeOClient := fakeoclientset.NewSimpleClientset()
 		fakeClient := &fakekclientset.Clientset{}
-
+		// fakeDynamicClientPool.ClientForGroupVersionKind(kind schema.GroupVersionKind) 
+		fakeDynamicClientPool := &fakedynamic.FakeClientPool{}
+		// fakeScalesClient.Scales(namespace).Get(schema.GroupResource, name string)
+		fakeScalesClient := &fakescale.FakeScaleClient{}
+		informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+		namespaceInformer := informerscorev1.NewFilteredNamespaceInformer(fakeClient, 0, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc}, tweakListOpts)
 		fakeOClient.AddReactor("list", "deploymentconfigs", func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 			list := &appsv1.DeploymentConfigList{}
 			for i := range test.deploymentConfigs {
@@ -386,6 +416,22 @@ func TestSync(t *testing.T) {
 			return true, list, nil
 		})
 
+		fakeClient.AddReactor("list", "replicasets", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
+			list := &kappsv1.ReplicaSetList{}
+			for i := range test.replicasets {
+				list.Items = append(list.Items, *test.replicaSets[i])
+			}
+			return true, list, nil
+		})
+
+		fakeClient.AddReactor("list", "statefulsets", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
+			list := &kappsv1.StatefulSetList{}
+			for i := range test.statefulsets {
+				list.Items = append(list.Items, *test.statefulSets[i])
+			}
+			return true, list, nil
+		})
+
 		fakeClient.AddReactor("list", "pods", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
 			list := &corev1.PodList{}
 			for i := range test.pods {
@@ -394,14 +440,8 @@ func TestSync(t *testing.T) {
 			return true, list, nil
 		})
 
-		fakeCache := cache.NewCache(fakeOClient, fakeClient, clientConfig, nil)
+		fakeCache := cache.NewResourceStore(fakeOClient, fakeClient, fakeDynamicClientPool, fakeScaleClient, fakeInformerFactory, fakeProjectInformer)
 		idler := NewIdler(config, fakeCache)
-		for _, resource := range test.resources {
-			err := idler.resources.Indexer.AddResourceObject(resource)
-			if err != nil {
-				t.Logf("Error: %s", err)
-			}
-		}
 		idler.sync(test.netmap)
 		assert.Equal(t, idler.queue.Len(), test.expectedQueueLen, "expected items did not match actual items in workqueue")
 		nsList := examineQueue(idler.queue)
@@ -410,7 +450,7 @@ func TestSync(t *testing.T) {
 	}
 }
 
-func pod(name, namespace string) *corev1.Pod {
+func pod(name, namespace string, restartPolicy, activeDeadlineSeconds, memory, startTime, phase, containerListForMemory) *corev1.Pod {
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "Pod",
@@ -418,6 +458,15 @@ func pod(name, namespace string) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
+		},
+		Spec: metav1.PodSpec{
+			RestartPolicy:      restartPolicy,
+			ActiveDeadlineSeconds: activeDeadlineSeconds,
+			Containers: containerListForMemory,//Containers[0].Resources.Limits["memory"]
+		},
+		Status: metav1.PodStatus{
+			StartTime:     startTime,
+			Phase: phase,
 		},
 	}
 }
@@ -455,20 +504,6 @@ func dc(name, namespace string) *appsv1.DeploymentConfig {
 			Name:      name,
 			Namespace: namespace,
 		},
-	}
-}
-
-func podResource(uid, name, namespace, resourceVersion string, request resource.Quantity, rt []*cache.RunningTime, labels map[string]string) *cache.ResourceObject {
-	return &cache.ResourceObject{
-		UID:             types.UID(uid),
-		Name:            name,
-		Namespace:       namespace,
-		Kind:            cache.PodKind,
-		ResourceVersion: resourceVersion,
-		MemoryRequested: request,
-		RunningTimes:    rt,
-		Terminating:     false,
-		Labels:          labels,
 	}
 }
 

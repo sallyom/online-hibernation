@@ -1,23 +1,28 @@
-package idling
+package autoidling
 
 import (
 	"fmt"
 	"time"
 
 	"github.com/golang/glog"
+
 	"github.com/openshift/online-hibernation/pkg/cache"
+
+	"golang.org/x/net/context"
+
 	"github.com/prometheus/client_golang/api/prometheus"
 	"github.com/prometheus/common/model"
 
-	"golang.org/x/net/context"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/workqueue"
 )
 
 const MaxRetries = 2
 
-// IdlerConfig is the configuration for the prometheus client and idler.
-type IdlerConfig struct {
+// AutoIdlerConfig is the configuration for the prometheus client and idler.
+type AutoIdlerConfig struct {
 	PrometheusClient   prometheus.Client
 	IdleSyncPeriod     time.Duration
 	IdleQueryPeriod    time.Duration
@@ -27,27 +32,27 @@ type IdlerConfig struct {
 	ProjectSleepPeriod time.Duration
 }
 
-// Idler is the auto-idler object
-type Idler struct {
-	config    *IdlerConfig
-	resources *cache.Cache
-	queue     workqueue.RateLimitingInterface
-	stopChan  <-chan struct{}
+// AutoIdler is the auto-idler object
+type AutoIdler struct {
+	config        *AutoIdlerConfig
+	resourceStore *cache.ResourceStore
+	queue         workqueue.RateLimitingInterface
+	stopChan      <-chan struct{}
 }
 
-// NewIdler returns an Idler object
-func NewIdler(ic *IdlerConfig, c *cache.Cache) *Idler {
-	ctrl := &Idler{
-		config:    ic,
-		resources: c,
-		queue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "auto-idler"),
+// NewAutoIdler returns an AutoIdler object
+func NewAutoIdler(ic *AutoIdlerConfig, rs *cache.ResourceStore) *AutoIdler {
+	ctrl := &AutoIdler{
+		config:        ic,
+		resourceStore: rs,
+		queue:         workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "auto-idler"),
 	}
 	return ctrl
 }
 
 // Run starts the idler controller and keeps it going until
 // the given channel is closed.
-func (idler *Idler) Run(stopChan <-chan struct{}) {
+func (idler *AutoIdler) Run(stopChan <-chan struct{}) {
 	idler.stopChan = stopChan
 	go wait.Until(idler.getNetmapAndSync, idler.config.IdleSyncPeriod, stopChan)
 	for i := 1; i <= idler.config.SyncWorkers; i++ {
@@ -62,7 +67,7 @@ func (idler *Idler) Run(stopChan <-chan struct{}) {
 // over the IdleQueryPeriod for all pods, separated by namespace.  Only results with
 // network activity below the idler threshold are returned.  This function returns
 // a map of namespace:networkActivity (bytes).
-func (idler *Idler) GetNetworkActivity() map[string]float64 {
+func (idler *AutoIdler) GetNetworkActivity() map[string]float64 {
 	glog.V(2).Infof("Auto-idler: Querying prometheus to get  network activity for projects")
 	queryAPI := prometheus.NewQueryAPI(idler.config.PrometheusClient)
 	// idler.conifg.Threshold can only be set via command line flags
@@ -91,43 +96,46 @@ func (idler *Idler) GetNetworkActivity() map[string]float64 {
 // If a project has scalable resources and is in the map of projects below the idling
 // threshold and if the idler is not in DryRun mode, then that project name is
 // added to the queue of projects to be idled.
-func (idler *Idler) sync(netmap map[string]float64) {
+func (idler *AutoIdler) sync(netmap map[string]float64) {
 	glog.V(1).Infof("Auto-idler: Running project sync")
-	projects, err := idler.resources.Indexer.ByIndex("ofKind", cache.ProjectKind)
+	projects, err := idler.resourceStore.ProjectList.List(labels.Everything())
 	if err != nil {
 		glog.Errorf("Auto-idler: %s", err)
 		return
 	}
-	for _, namespace := range projects {
-		ns := namespace.(*cache.ResourceObject).Name
-		scalable, err := idler.checkForScalables(ns)
+	for _, p := range projects {
+		// TODO: Not sure why "" is returned here, but it is...
+		if p.Name == "" {
+			continue
+		}
+		scalable, err := idler.checkForScalables(p.Name)
 		if err != nil {
 			glog.Errorf("Auto-idler: %s", err)
 			continue
 		}
 		if !scalable {
-			glog.V(2).Infof("Auto-idler: Project( %s )sync complete", ns)
+			glog.V(2).Infof("Auto-idler: Project( %s )sync complete", p.Name)
 			continue
 		}
-		nsInMap := false
-		if bytes, ok := netmap[ns]; ok {
-			nsInMap = true
+		projInMap := false
+		if bytes, ok := netmap[p.Name]; ok {
+			projInMap = true
 			if idler.config.IdleDryRun {
-				glog.V(2).Infof("Auto-idler: Project( %s )netrx bytes( %v )below idling threshold, but currently in DryRun mode", ns, bytes)
+				glog.V(2).Infof("Auto-idler: Project( %s )netrx bytes( %v )below idling threshold, but currently in DryRun mode", p.Name, bytes)
 			} else {
-				glog.V(2).Infof("Auto-idler: Project( %s )netrx bytes( %v )below idling threshold", ns, bytes)
-				idler.queue.Add(ns)
+				glog.V(2).Infof("Auto-idler: Project( %s )netrx bytes( %v )below idling threshold", p.Name, bytes)
+				idler.queue.Add(p.Name)
 			}
 		}
-		if !nsInMap {
-			glog.V(2).Infof("Auto-idler: Project( %s )sync complete", ns)
+		if !projInMap {
+			glog.V(2).Infof("Auto-idler: Project( %s )sync complete", p.Name)
 		}
 	}
 }
 
 // getNetmapAndSync allows for unit testing, to test sync code
 // with a fake prometheus query return
-func (idler *Idler) getNetmapAndSync() {
+func (idler *AutoIdler) getNetmapAndSync() {
 	netmap := idler.GetNetworkActivity()
 	if len(netmap) == 0 {
 		glog.V(2).Infof("Auto-idler: Unable to sync projects, no data obtained from prometheus")
@@ -137,7 +145,7 @@ func (idler *Idler) getNetmapAndSync() {
 }
 
 // startWorker gets items from the queue hands them to syncProject
-func (idler *Idler) startWorker() func() {
+func (idler *AutoIdler) startWorker() func() {
 	workFunc := func() bool {
 		ns, quit := idler.queue.Get()
 		if quit {
@@ -171,17 +179,16 @@ func (idler *Idler) startWorker() func() {
 
 // syncProject gets project from the cache, does a final check for
 // IsAsleep and IsIdled and then calls autoIdleProjectServices.
-func (idler *Idler) syncProject(namespace string) error {
-	project, err := idler.resources.GetProject(namespace)
+func (idler *AutoIdler) syncProject(namespace string) error {
+	isAsleep, err := idler.resourceStore.IsAsleep(namespace)
 	if err != nil {
 		return err
 	}
-	if project.IsAsleep {
+	if isAsleep {
 		glog.V(2).Infof("Auto-idler: Ignoring project( %s ), currently in force-sleep", namespace)
 		return nil
 	}
-	glog.V(2).Infof("Auto-idler: Syncing project: %s ", project.Name)
-	glog.V(2).Infof("Auto-idler: Idling project( %s )", namespace)
+	glog.V(2).Infof("Auto-idler: Syncing project: %s ", namespace)
 	err = idler.autoIdleProjectServices(namespace)
 	if err != nil {
 		return err
@@ -192,18 +199,18 @@ func (idler *Idler) syncProject(namespace string) error {
 
 // checkForScalables returns true if there are scalable resources
 // associated with pods in a namespace
-func (idler *Idler) checkForScalables(namespace string) (bool, error) {
+func (idler *AutoIdler) checkForScalables(namespace string) (bool, error) {
 	scalable := false
-	project, err := idler.resources.GetProject(namespace)
+	// Extra check here, not sure it's necessary
+	isAsleep, err := idler.resourceStore.IsAsleep(namespace)
 	if err != nil {
 		return scalable, err
 	}
-	// Extra check here, not sure it's necessary
-	if project.IsAsleep {
+	if isAsleep {
 		glog.V(2).Infof("Auto-idler: Ignoring project( %s ), currently in force-sleep.", namespace)
 		return scalable, nil
 	}
-	svcs, err := idler.resources.GetProjectServices(namespace)
+	svcs, err := idler.resourceStore.ServiceList.Services(namespace).List(labels.Everything())
 	if err != nil {
 		return scalable, err
 	}
@@ -212,7 +219,7 @@ func (idler *Idler) checkForScalables(namespace string) (bool, error) {
 		return scalable, nil
 	}
 
-	projectPods, err := idler.resources.GetProjectPods(namespace)
+	projectPods, err := idler.resourceStore.PodList.Pods(namespace).List(labels.Everything())
 	if err != nil {
 		return scalable, err
 	}
@@ -222,26 +229,22 @@ func (idler *Idler) checkForScalables(namespace string) (bool, error) {
 		return scalable, nil
 	}
 
-	for _, podObj := range projectPods {
-		pod := podObj.(*cache.ResourceObject)
-		if _, ok := pod.Labels[cache.BuildAnnotation]; ok {
-			if pod.IsStarted() {
-				glog.V(2).Infof("Auto-idler: Ignoring project( %s ), builder pod( %s ) found in project.", namespace, pod.Name)
+	for _, pod := range projectPods {
+		if _, ok := pod.ObjectMeta.Labels[cache.BuildAnnotation]; ok {
+			if pod.Status.Phase == corev1.PodRunning {
+				glog.V(2).Infof("Auto-idler: Ignoring project( %s ), builder pod( %s ) found in project.", pod.Namespace, pod.Name)
 				return scalable, nil
 			}
 		}
-		if len(pod.RunningTimes) == 0 {
-			return scalable, nil
-		}
-		if time.Since(pod.RunningTimes[0].Start) < idler.config.IdleQueryPeriod {
-			glog.V(2).Infof("Auto-idler: Ignoring project( %s ), either pod( %s )or controller hasn't been running for complete idling cycle.", namespace, pod.Name)
+		if time.Since(pod.Status.StartTime.Time) < idler.config.IdleQueryPeriod {
+			glog.V(2).Infof("Auto-idler: Ignoring project( %s ), pod( %s )hasn't been running for complete idling cycle.", pod.Namespace, pod.Name)
 			return scalable, nil
 		}
 	}
-	var scalablePods []interface{}
+	var scalablePods []*corev1.Pod
 	for _, svc := range svcs {
 		// Only consider pods with services for idling.
-		podsWService := idler.resources.GetPodsForService(svc.(*cache.ResourceObject), projectPods)
+		podsWService := idler.resourceStore.GetPodsForService(svc, projectPods)
 		for _, pod := range podsWService {
 			scalablePods = append(scalablePods, pod)
 		}
@@ -266,55 +269,31 @@ func (idler *Idler) checkForScalables(namespace string) (bool, error) {
 //   2. for each service, get pods on service by label selector
 //   3. get the controller on each pod (and, in the case of DCs, get the controller on that controller)
 //   4. get endpoint with the same name as the service
-func (idler *Idler) autoIdleProjectServices(namespace string) error {
+func (idler *AutoIdler) autoIdleProjectServices(namespace string) error {
 	nowTime := time.Now()
-	project, err := idler.resources.GetProject(namespace)
+	isAsleep, err := idler.resourceStore.IsAsleep(namespace)
 	if err != nil {
 		return err
 	}
-	if project.IsAsleep {
+	if isAsleep {
 		glog.V(2).Infof("Auto-idler: Project( %s )currently in force-sleep, exiting...", namespace)
 		return nil
 	}
 
 	glog.V(0).Infof("Auto-idler: Adding previous scale annotation in project( %s )", namespace)
-	err = AddProjectPreviousScaleAnnotation(idler.resources, namespace)
+	err = idler.resourceStore.AddProjectPreviousScaleAnnotation(namespace)
 	if err != nil {
 		return fmt.Errorf("Error adding project( %s )previous scale annotation: %s", namespace, err)
 	}
 
-	glog.V(2).Infof("Auto-idler: Scaling DCs in project %s", namespace)
-	err = ScaleProjectDCs(idler.resources, namespace)
+	glog.V(2).Infof("Auto-idler: Scaling  objects in project %s", namespace)
+	err = idler.resourceStore.ScaleAllScalableObjectsInNamespace(namespace)
 	if err != nil {
-		return fmt.Errorf("Error scaling DCs in project %s: %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Auto-idler: Scaling RCs in project %s", namespace)
-	err = ScaleProjectRCs(idler.resources, namespace)
-	if err != nil {
-		return fmt.Errorf("Error scaling RCs in project %s: %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Auto-idler: Scaling Deployments in project %s", namespace)
-	err = ScaleProjectDeployments(idler.resources, namespace)
-	if err != nil {
-		return fmt.Errorf("Error scaling Deployments in project %s: %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Auto-idler: Scaling ReplicaSets in project %s", namespace)
-	err = ScaleProjectRSs(idler.resources, namespace)
-	if err != nil {
-		return fmt.Errorf("Error scaling ReplicaSets in project %s: %s", namespace, err)
-	}
-
-	glog.V(2).Infof("Auto-idler: Deleting pods in project %s", namespace)
-	err = DeleteProjectPods(idler.resources, namespace)
-	if err != nil {
-		return fmt.Errorf("Error deleting pods in project %s: %s", namespace, err)
+		return fmt.Errorf("Error scaling objects in project %s: %s", namespace, err)
 	}
 
 	glog.V(0).Infof("Auto-idler: Adding idled-at annotation in project( %s )", namespace)
-	err = AddProjectIdledAtAnnotation(idler.resources, namespace, nowTime, idler.config.ProjectSleepPeriod)
+	err = idler.resourceStore.AddProjectIdledAtAnnotation(namespace, nowTime, idler.config.ProjectSleepPeriod)
 	if err != nil {
 		return fmt.Errorf("Error adding idled-at annotation in project( %s ): %v", namespace, err)
 	}
