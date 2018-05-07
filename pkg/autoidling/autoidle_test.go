@@ -13,19 +13,23 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kappsv1 "k8s.io/api/apps/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	fakekclientset "k8s.io/client-go/kubernetes/fake"
 	fakescale "k8s.io/client-go/scale/fake"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
-	restclient "k8s.io/client-go/rest"
+	//restclient "k8s.io/client-go/rest"
 	ktesting "k8s.io/client-go/testing"
 	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	informerscorev1 "k8s.io/client-go/informers/core/v1"
+	listerscorev1 "k8s.io/client-go/listers/core/v1"
+	informers "k8s.io/client-go/informers"
+	utilwait "k8s.io/apimachinery/pkg/util/wait"
 )
 
 func init() {
@@ -40,12 +44,37 @@ func tweakListOpts(options *metav1.ListOptions) {
 	options.LabelSelector = labelselector
 }
 
-func containerListForMemory(memory string)[]metav1.Container {
-	var containerList []metav1.Container
+func NewFakeResourceStore(oclient fakeoclientset.Clientset, kc fakekclientset.Clientset, dynamicClientPool fakedynamic.FakeClientPool, scaleClient fakescale.FakeScaleClient, informerfactory informers.SharedInformerFactory, projectInformer kcache.SharedIndexInformer) *cache.ResourceStore {
+	informer := informerfactory.Core().V1().Pods()
+	scalableStore := cache.NewScalableStore(informerfactory)
+	pl := listerscorev1.NewNamespaceLister(projectInformer.GetIndexer())
+	resourceStore := &cache.ResourceStore{
+		KubeClient:  &kc,
+		OSClient:    &oclient,
+		PodList:     informer.Lister(),
+		ProjectList: pl,
+		ServiceList: informerfactory.Core().V1().Services().Lister(),
+		Scalables:   scalableStore,
+		ClientPool:  &dynamicClientPool,
+		ScaleClient: &scaleClient,
+	}
+	informer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
+		DeleteFunc: func(podRaw interface{}) {
+			pod := podRaw.(*corev1.Pod)
+			if err := resourceStore.RecordDeletedPodRuntime(pod); err != nil {
+				utilruntime.HandleError(err)
+			}
+		},
+	})
+	return resourceStore
+}
+
+func containerListForMemory(memory string)[]corev1.Container {
+	var containerList []corev1.Container
 	quantity := resource.MustParse(memory)
-	limits := make(map[metav1.ResourceName]resource.Quantity)
+	limits := make(map[corev1.ResourceName]resource.Quantity)
 	limits["memory"] = quantity
-	container := metav1.Container{Name: "aname", Resources: metav1.ResourceRequirements{Limits: limits}}
+	aContainer := corev1.Container{Name: "aname", Resources: corev1.ResourceRequirements{Limits: limits}}
 	containerList = append(containerList, aContainer)
 	return containerList
 }
@@ -54,344 +83,62 @@ func TestSync(t *testing.T) {
 	tests := map[string]struct {
 		idleDryRun             bool
 		netmap                 map[string]float64
-		deploymentConfigs      []*appsv1.DeploymentConfig
 		pods                   []*corev1.Pod
+		projects			   []*corev1.Namespace
 		services               []*corev1.Service
 		replicationControllers []*corev1.ReplicationController
 		statefulSets		   []*kappsv1.StatefulSet
 		replicaSets			   []*kappsv1.ReplicaSet
 		deployments			   []*kappsv1.Deployment
-		resources              []*cache.ResourceStore
+		deploymentConfigs      []*appsv1.DeploymentConfig
 		expectedQueueLen       int
 		expectedQueueKeys      []string
 	}{
 		"Single item added to queue": {
 			idleDryRun: false,
 			netmap:     map[string]float64{"somens1": 1000},
+			//func deletedPod(name, namespace string, labels map[string]string, activeDeadlineSeconds *int64, memory string, startTime metav1.Time, deltime metav1.Time) *corev1.Pod {
+			//func pod(name, namespace string, labels map[string]string, activeDeadlineSeconds *int64, memory string, startTime metav1.Time, containerListForMemory []corev1.Container) *corev1.Pod {
 			pods: []*corev1.Pod{
-				pod("somepod1", "somens1", corev1.RestartPolicyAlways, nil, containerListForMemory("500Mi"), time.Now().Add(-1*time.Hour), corev1.PodRunning),
+				pod("somepod1", "somens1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}, nil, "500Mi", metav1.NewTime(metav1.Now().Add(-1*time.Hour)), corev1.PodRunning),
 			},
+			//func svc(name, namespace string, selector map[string]string) *corev1.Service {
 			services: []*corev1.Service{
-				svc("somesvc1", "somens1"),
+				svc("somesvc1", "somens1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
 			},
+			//func rc(name, namespace, dcName string, replicas *int32, labels, annotations map[string]string) *corev1.ReplicationController {
 			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc1", "somens1"),
+				rc("somerc1", "somens1", "apoddc", 1, map[string]string{},map[string]string{}),
 			},
+			// NOTE: int32 not *int32
+			//func dc(name, namespace string, replicas int32, labels, annotations map[string]string) *appsv1.DeploymentConfig {
 			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("apoddc", "somens1"),
+				dc("apoddc", "somens1", 1, map[string]string{}, map[string]string{}),
 			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens1", false),
-				rcResource("somerc1", "somerc1", "somens1", "1", "apoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod1", "somepod1", "somens1", "1",
-					resource.MustParse("500M"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				svcResource("1234", "somesvc1", "somens1", "1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
+			//func terminatingNamespace(name, namespace string, labels, annotations map[string]string) *corev1.Namespace {
+			projects: []*corev1.Namespace{
+				activeNamespace("somens1", "somens1", map[string]string{cache.HibernationLabel: "true"}, map[string]string{}),
+				terminatingNamespace("someDeletedNS", "someDeletedNS", map[string]string{cache.HibernationLabel: "true"}, map[string]string{}),
 			},
+			//func ss(name, namespace string, replicas *int32, labels, annotations map[string]string) *kappsv1.StatefulSet {
 			expectedQueueLen:  1,
 			expectedQueueKeys: []string{"somens1"},
 		},
 
-		"2 items added to queue": {
-			idleDryRun: false,
-			netmap:     map[string]float64{"somens2": 1000, "somens1": 1000},
-			pods: []*corev1.Pod{
-				pod("somepod1", "somens1"),
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc1", "somens1"),
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc1", "somens1"),
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("apoddc", "somens1"),
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens1", false),
-				projectResource("somens2", false),
-				rcResource("somerc1", "somerc1", "somens1", "1", "apoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod1", "somepod1", "somens1", "1",
-					resource.MustParse("500M"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-				svcResource("1234", "somesvc1", "somens1", "1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  2,
-			expectedQueueKeys: []string{"somens1", "somens2"},
-		},
-
-		"Project with len(RunningTimes) == 0 doesn't panic": {
-			idleDryRun: false,
-			netmap:     map[string]float64{"somens2": 1000, "somens1": 1000},
-			pods: []*corev1.Pod{
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens2", false),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{},
-					map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  0,
-			expectedQueueKeys: nil,
-		},
-
-		"Project with pod runningTime < IdleQueryPeriod not added to queue": {
-			idleDryRun: false,
-			netmap:     map[string]float64{"somens2": 1000, "somens1": 1000},
-			pods: []*corev1.Pod{
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens2", false),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Minute),
-							time.Time{}),
-					},
-					map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  0,
-			expectedQueueKeys: nil,
-		},
-
-		"2 items are scalable, but in IdleDryRun, no projects added to queue": {
-			idleDryRun: true,
-			netmap:     map[string]float64{"somens2": 1000, "somens1": 1000},
-			pods: []*corev1.Pod{
-				pod("somepod1", "somens1"),
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc1", "somens1"),
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc1", "somens1"),
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("apoddc", "somens1"),
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens1", false),
-				projectResource("somens2", false),
-				rcResource("somerc1", "somerc1", "somens1", "1", "apoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod1", "somepod1", "somens1", "1",
-					resource.MustParse("500M"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-				svcResource("1234", "somesvc1", "somens1", "1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  0,
-			expectedQueueKeys: nil,
-		},
-
-		"No scalable resources in projects, no project added to queue": {
-			idleDryRun: false,
-			netmap:     map[string]float64{"somens2": 1000, "somens1": 1000},
-			pods: []*corev1.Pod{
-				pod("somepod1", "somens1"),
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc1", "somens1"),
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc1", "somens1"),
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("apoddc", "somens1"),
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens1", false),
-				projectResource("somens2", false),
-				rcResource("somerc1", "somerc1", "somens1", "1", "apoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod1", "somepod1", "somens1", "1",
-					resource.MustParse("500M"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"foo": "bar"}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"cheese": "sandwich"}),
-				svcResource("1234", "somesvc1", "somens1", "1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  0,
-			expectedQueueKeys: nil,
-		},
-
-		"Netmap len 0, no panic": {
-			idleDryRun: false,
-			netmap:     map[string]float64{},
-			pods: []*corev1.Pod{
-				pod("somepod1", "somens1"),
-				pod("somepod2", "somens2"),
-			},
-			services: []*corev1.Service{
-				svc("somesvc1", "somens1"),
-				svc("somesvc2", "somens2"),
-			},
-			replicationControllers: []*corev1.ReplicationController{
-				rc("somerc1", "somens1"),
-				rc("somerc2", "somens2"),
-			},
-			deploymentConfigs: []*appsv1.DeploymentConfig{
-				dc("apoddc", "somens1"),
-				dc("anotherpoddc", "somens2"),
-			},
-			resources: []*cache.ResourceObject{
-				projectResource("somens1", false),
-				projectResource("somens2", false),
-				rcResource("somerc1", "somerc1", "somens1", "1", "apoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				rcResource("somerc2", "somerc2", "somens2", "1", "anotherpoddc", []*cache.RunningTime{
-					runningTime(time.Now().Add(-1*time.Hour),
-						time.Time{}),
-				}),
-				podResource("somepod1", "somepod1", "somens1", "1",
-					resource.MustParse("500M"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"foo": "bar"}),
-				podResource("somepod2", "somepod2", "somens2", "2",
-					resource.MustParse("1G"),
-					[]*cache.RunningTime{
-						runningTime(time.Now().Add(-1*time.Hour),
-							time.Time{}),
-					},
-					map[string]string{"cheese": "sandwich"}),
-				svcResource("1234", "somesvc1", "somens1", "1", map[string]string{"app": "anapp", "deploymentconfig": "apoddc"}),
-				svcResource("5678", "somesvc2", "somens2", "2", map[string]string{"app": "anotherapp", "deploymentconfig": "anotherpoddc"}),
-			},
-			expectedQueueLen:  0,
-			expectedQueueKeys: nil,
-		},
 	}
 
 	for name, test := range tests {
 		t.Logf("Testing: %s", name)
-		config := &IdlerConfig{
+		config := &AutoIdlerConfig{
 			IdleSyncPeriod:  10 * time.Minute,
 			IdleQueryPeriod: 10 * time.Minute,
 			Threshold:       2000,
 			SyncWorkers:     2,
 			IdleDryRun:      test.idleDryRun,
 		}
-
-		clientConfig := &restclient.Config{
-			Host: "127.0.0.1",
-			ContentConfig: restclient.ContentConfig{GroupVersion: &corev1.SchemeGroupVersion,
-				NegotiatedSerializer: cache.Codecs},
-		}
 		fakeOClient := fakeoclientset.NewSimpleClientset()
-		fakeClient := &fakekclientset.Clientset{}
-		// fakeDynamicClientPool.ClientForGroupVersionKind(kind schema.GroupVersionKind) 
-		fakeDynamicClientPool := &fakedynamic.FakeClientPool{}
-		// fakeScalesClient.Scales(namespace).Get(schema.GroupResource, name string)
-		fakeScalesClient := &fakescale.FakeScaleClient{}
-		informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
-		namespaceInformer := informerscorev1.NewFilteredNamespaceInformer(fakeClient, 0, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc}, tweakListOpts)
+		fakeClient := fakekclientset.NewSimpleClientset()
+
 		fakeOClient.AddReactor("list", "deploymentconfigs", func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
 			list := &appsv1.DeploymentConfigList{}
 			for i := range test.deploymentConfigs {
@@ -418,7 +165,7 @@ func TestSync(t *testing.T) {
 
 		fakeClient.AddReactor("list", "replicasets", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
 			list := &kappsv1.ReplicaSetList{}
-			for i := range test.replicasets {
+			for i := range test.replicaSets {
 				list.Items = append(list.Items, *test.replicaSets[i])
 			}
 			return true, list, nil
@@ -426,7 +173,7 @@ func TestSync(t *testing.T) {
 
 		fakeClient.AddReactor("list", "statefulsets", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
 			list := &kappsv1.StatefulSetList{}
-			for i := range test.statefulsets {
+			for i := range test.statefulSets {
 				list.Items = append(list.Items, *test.statefulSets[i])
 			}
 			return true, list, nil
@@ -439,18 +186,39 @@ func TestSync(t *testing.T) {
 			}
 			return true, list, nil
 		})
+		//clientConfig := &restclient.Config{Host: "127.0.0.1" }
+		// fakeDynamicClientPool.ClientForGroupVersionKind(kind schema.GroupVersionKind) 
+		fakeDynamicClientPool := &fakedynamic.FakeClientPool{}
+		// fakeScalesClient.Scales(namespace).Get(schema.GroupResource, name string)
+		fakeScaleClient := &fakescale.FakeScaleClient{}
+		informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
+		namespaceInformer := informerscorev1.NewFilteredNamespaceInformer(fakeClient, 0, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc}, tweakListOpts)
+		resources := NewFakeResourceStore(*fakeOClient, *fakeClient, *fakeDynamicClientPool, *fakeScaleClient, informerFactory, namespaceInformer)
 
-		fakeCache := cache.NewResourceStore(fakeOClient, fakeClient, fakeDynamicClientPool, fakeScaleClient, fakeInformerFactory, fakeProjectInformer)
-		idler := NewIdler(config, fakeCache)
+		informerFactory.Start(utilwait.NeverStop)
+		go namespaceInformer.Run(utilwait.NeverStop)
+
+
+		// TODO: RESOURCE STORE IS NIL....
+		assert.Equal(t, len(test.pods), 1, "expected pods in the list")
+		podList, _ := resources.PodList.Pods("somens1").List(labels.Everything())
+		assert.Equal(t, len(podList), 1, "expected a pod")
+		podsInNS, _ := resources.PodList.Pods("somens1").List(labels.Everything())
+		assert.Equal(t, len(podsInNS), 1, "expected a pod in resourceStore")
+		nsInStore, _ := resources.ProjectList.Get("somens1")
+		assert.Equal(t, nsInStore.Name, "somens1", "expected a ns in resourceStore")
+		idler := NewAutoIdler(config, resources)
 		idler.sync(test.netmap)
 		assert.Equal(t, idler.queue.Len(), test.expectedQueueLen, "expected items did not match actual items in workqueue")
 		nsList := examineQueue(idler.queue)
 		assert.Equal(t, nsList, test.expectedQueueKeys, "unexpected queue contents")
 		idler.queue.ShutDown()
+
 	}
 }
 
-func pod(name, namespace string, restartPolicy, activeDeadlineSeconds, memory, startTime, phase, containerListForMemory) *corev1.Pod {
+func pod(name, namespace string, labels map[string]string, activeDeadlineSeconds *int64, memory string, startTime metav1.Time, phase corev1.PodPhase) *corev1.Pod {
+	containerList := containerListForMemory(memory)
 	return &corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "Pod",
@@ -458,20 +226,64 @@ func pod(name, namespace string, restartPolicy, activeDeadlineSeconds, memory, s
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
+			Labels: labels,
 		},
-		Spec: metav1.PodSpec{
-			RestartPolicy:      restartPolicy,
+		Spec: corev1.PodSpec{
+			RestartPolicy:      corev1.RestartPolicyAlways,
 			ActiveDeadlineSeconds: activeDeadlineSeconds,
-			Containers: containerListForMemory,//Containers[0].Resources.Limits["memory"]
+			Containers: containerList,
 		},
-		Status: metav1.PodStatus{
-			StartTime:     startTime,
+		Status: corev1.PodStatus{
+			StartTime:     &startTime,
 			Phase: phase,
 		},
 	}
 }
 
-func rc(name, namespace string) *corev1.ReplicationController {
+func deletedPod(name, namespace string, labels map[string]string, activeDeadlineSeconds *int64, memory string, startTime metav1.Time, phase corev1.PodPhase, deltime metav1.Time) *corev1.Pod {
+	containerList := containerListForMemory(memory)
+	return &corev1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Pod",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			DeletionTimestamp: &deltime,
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:      corev1.RestartPolicyAlways,
+			ActiveDeadlineSeconds: activeDeadlineSeconds,
+			Containers: containerList,
+		},
+		Status: corev1.PodStatus{
+			StartTime:     &startTime,
+			Phase: phase,
+		},
+	}
+}
+// NOTE: int32 not *int32
+func dc(name, namespace string, replicas int32, labels, annotations map[string]string) *appsv1.DeploymentConfig {
+	return &appsv1.DeploymentConfig{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "DeploymentConfig",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Spec: appsv1.DeploymentConfigSpec{
+			Replicas: replicas,
+		},
+	}
+}
+
+func rc(name, namespace, dcName string, replicas int32, labels, annotations map[string]string) *corev1.ReplicationController {
+	isController := true
+	rep := &replicas
 	return &corev1.ReplicationController{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "ReplicationController",
@@ -479,11 +291,80 @@ func rc(name, namespace string) *corev1.ReplicationController {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "DeploymentConfig",
+					Name: dcName,
+					Controller: &isController,
+					BlockOwnerDeletion: &isController,
+				},
+			},
+		},
+		Spec: corev1.ReplicationControllerSpec{
+			Replicas: rep,
 		},
 	}
 }
 
-func svc(name, namespace string) *corev1.Service {
+// TODO: Add OwnerRefs for rs,ss,dep?
+func rs(name, namespace string, replicas int32, labels, annotations map[string]string) *kappsv1.ReplicaSet {
+	rep := &replicas
+	return &kappsv1.ReplicaSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "ReplicaSet",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Spec: kappsv1.ReplicaSetSpec{
+			Replicas: rep,
+		},
+	}
+}
+
+// TODO: Add OwnerRefs for rs,ss,dep?
+func ss(name, namespace string, replicas int32, labels, annotations map[string]string) *kappsv1.StatefulSet {
+	rep :=&replicas
+	return &kappsv1.StatefulSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "StatefulSet",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Spec: kappsv1.StatefulSetSpec{
+			Replicas: rep,
+		},
+	}
+}
+// TODO: Add OwnerRefs for rs,ss,dep?
+func dep(name, namespace string, replicas int32, labels, annotations map[string]string) *kappsv1.Deployment {
+	rep := &replicas
+	return &kappsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Spec: kappsv1.DeploymentSpec{
+			Replicas: rep,
+		},
+	}
+}
+
+func svc(name, namespace string, selectors map[string]string) *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
 			Kind: "Service",
@@ -492,58 +373,43 @@ func svc(name, namespace string) *corev1.Service {
 			Name:      name,
 			Namespace: namespace,
 		},
+		Spec: corev1.ServiceSpec{
+			Selector: selectors,
+		},
 	}
 }
 
-func dc(name, namespace string) *appsv1.DeploymentConfig {
-	return &appsv1.DeploymentConfig{
+func activeNamespace(name, namespace string, labels, annotations map[string]string) *corev1.Namespace {
+	return &corev1.Namespace{
 		TypeMeta: metav1.TypeMeta{
-			Kind: "ReplicationController",
+			Kind: "Namespace",
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Status: corev1.NamespaceStatus{
+			Phase: corev1.NamespaceActive,
 		},
 	}
 }
 
-func rcResource(uid, name, namespace, resourceVersion, dc string, rt []*cache.RunningTime) *cache.ResourceObject {
-	return &cache.ResourceObject{
-		UID:             types.UID(uid),
-		Name:            name,
-		Namespace:       namespace,
-		Kind:            cache.RCKind,
-		ResourceVersion: resourceVersion,
-		RunningTimes:    rt,
-	}
-}
-
-func svcResource(uid string, name string, namespace string, resourceVersion string, selectors map[string]string) *cache.ResourceObject {
-	selector, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectors})
-	return &cache.ResourceObject{
-		UID:             types.UID(uid),
-		Name:            name,
-		Namespace:       namespace,
-		Kind:            cache.ServiceKind,
-		ResourceVersion: resourceVersion,
-		Selectors:       selector,
-	}
-}
-
-func projectResource(name string, isAsleep bool) *cache.ResourceObject {
-	return &cache.ResourceObject{
-		UID:       types.UID(name),
-		Name:      name,
-		Namespace: name,
-		Kind:      cache.ProjectKind,
-		IsAsleep:  isAsleep,
-	}
-}
-
-func runningTime(start, end time.Time) *cache.RunningTime {
-	return &cache.RunningTime{
-		Start: start,
-		End:   end,
+func terminatingNamespace(name, namespace string, labels, annotations map[string]string) *corev1.Namespace {
+	return &corev1.Namespace{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Namespace",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels: labels,
+			Annotations: annotations,
+		},
+		Status: corev1.NamespaceStatus{
+			Phase: corev1.NamespaceTerminating,
+		},
 	}
 }
 

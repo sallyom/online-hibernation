@@ -79,7 +79,7 @@ func NewResourceStore(oclient osclient.Interface, kc kclient.Interface, dynamicC
 	informer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(podRaw interface{}) {
 			pod := podRaw.(*corev1.Pod)
-			if err := resourceStore.recordDeletedPodRuntime(pod); err != nil {
+			if err := resourceStore.RecordDeletedPodRuntime(pod); err != nil {
 				utilruntime.HandleError(err)
 			}
 		},
@@ -97,8 +97,8 @@ func NewScalableStore(informerfactory informers.SharedInformerFactory) *Scalable
 	return scalableStore
 }
 
-// recordDeletedPodRuntime keeps track of runtimes of dead pods per namespace as project annotation
-func (rs *ResourceStore) recordDeletedPodRuntime(pod *corev1.Pod) error {
+// RecordDeletedPodRuntime keeps track of runtimes of dead pods per namespace as project annotation
+func (rs *ResourceStore) RecordDeletedPodRuntime(pod *corev1.Pod) error {
 	ns, err := rs.ProjectList.Get(pod.Namespace)
 	// If deleted pod is in excluded namespace, ignore
 	if err != nil {
