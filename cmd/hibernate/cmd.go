@@ -18,6 +18,7 @@ import (
 
 	flag "github.com/spf13/pflag"
 
+	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -34,7 +35,7 @@ import (
 	kcache "k8s.io/client-go/tools/cache"
 )
 
-func createClients() (*restclient.Config, kclient.Interface, dynamic.ClientPool, scale.ScalesGetter, error) {
+func createClients() (*restclient.Config, kclient.Interface, dynamic.ClientPool, iclient.IdlersGetter, error) {
 	return CreateClientsForConfig()
 }
 
@@ -47,7 +48,7 @@ func tweakListOpts(options *metav1.ListOptions) {
 
 // CreateClientsForConfig creates and returns OpenShift and Kubernetes clients (as well as other useful
 // client objects) for the given client config.
-func CreateClientsForConfig() (*restclient.Config, kclient.Interface, dynamic.ClientPool, scale.ScalesGetter, error) {
+func CreateClientsForConfig() (*restclient.Config, kclient.Interface, dynamic.ClientPool, iclient.IdlersGetter, error) {
 
 	clientConfig, err := restclient.InClusterConfig()
 	if err != nil {
@@ -56,18 +57,14 @@ func CreateClientsForConfig() (*restclient.Config, kclient.Interface, dynamic.Cl
 
 	//discoClient := discovery.NewDiscoveryClientForConfigOrDie(clientConfig)
 	kc := kclient.NewForConfigOrDie(clientConfig)
+	ic := iclient.NewForConfigOrDie(clientConfig)
 	cachedDiscovery := discocache.NewMemCacheClient(kc.Discovery())
 	restMapper := discovery.NewDeferredDiscoveryRESTMapper(cachedDiscovery, apimeta.InterfacesForUnstructured)
 	restMapper.Reset()
 
 	dynamicClientPool := dynamic.NewClientPool(clientConfig, restMapper, dynamic.LegacyAPIPathResolverFunc)
 
-	scaleKindResolver := scale.NewDiscoveryScaleKindResolver(kc.Discovery())
-	scaleClient, err := scale.NewForConfig(clientConfig, restMapper, dynamic.LegacyAPIPathResolverFunc, scaleKindResolver)
-	if err != nil {
-		glog.V(1).Infof("Error creating in-cluster config: %s", err)
-	}
-	return clientConfig, kc, dynamicClientPool, scaleClient, err
+	return clientConfig, kc, dynamicClientPool, ic, err
 }
 
 func setupPprof(mux *http.ServeMux) {
@@ -124,8 +121,7 @@ func main() {
 	}
 
 	//Set up clients
-	restConfig, kubeClient, dynamicClientPool, scaleClient, err := createClients()
-	osClient := osclient.NewForConfigOrDie(restConfig)
+	restConfig, kubeClient, dynamicClientPool, idlersClient, err := createClients()
 	var prometheusClient prometheus.Client
 
 	// @DirectXMan12 should be credited here for helping with the promCfg
@@ -154,7 +150,7 @@ func main() {
 	// TODO: 5 minutes is way too short.  Make it longer, like 2*time.Hour
 	informerFactory := informers.NewSharedInformerFactory(kubeClient, 5*time.Minute)
 	namespaceInformer := informerscorev1.NewFilteredNamespaceInformer(kubeClient, time.Minute, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc}, tweakListOpts)
-	resourceStore := cache.NewResourceStore(osClient, kubeClient, dynamicClientPool, scaleClient, informerFactory, namespaceInformer)
+	resourceStore := cache.NewResourceStore(kubeClient, dynamicClientPool, idlersClient, informerFactory, namespaceInformer)
 
 	sleeperConfig := &forcesleep.SleeperConfig{
 		Quota:              quota,

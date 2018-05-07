@@ -5,8 +5,8 @@ import (
 	"strconv"
 
 	"github.com/golang/glog"
-	//iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
 	appsv1 "github.com/openshift/api/apps/v1"
+	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
 	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,17 +24,15 @@ import (
 	listerscorev1 "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/scale"
 	kcache "k8s.io/client-go/tools/cache"
+	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 )
 
 const (
-	RCKind                           = "ReplicationController"
-	DCKind                           = "DeploymentConfig"
-	RSKind                           = "ReplicaSet"
-	SSKind                           = "StatefulSet"
-	DepKind                          = "Deployment"
-	appsV1GroupName                  = "apps.openshift.io"
+	// ProjectLastSleepTime contains the time the project was put to sleep(resource quota 'force-sleep' placed in namesace)
+	ProjectLastSleepTime  = "openshift.io/last-sleep-time"
 	ProjectDeadPodsRuntimeAnnotation = "openshift.io/project-dead-pods-runtime"
 	HibernationLabel                 = "openshift.io/hibernate-include"
+	HibernationIdler				 = "hibernation"
 	ProjectIsAsleepAnnotation        = "openshift.io/project-is-asleep"
 	ProjectSleepQuotaName            = "force-sleep"
 	OpenShiftDCName                  = "openshift.io/deployment-config.name"
@@ -43,38 +41,26 @@ const (
 
 type ResourceStore struct {
 	KubeClient  kclient.Interface
-	OSClient    osclient.Interface
 	PodList     listerscorev1.PodLister
 	ProjectList listerscorev1.NamespaceLister
 	ServiceList listerscorev1.ServiceLister
-	Scalables   *ScalableStore
 	ClientPool  dynamic.ClientPool
-	ScaleClient scale.ScalesGetter
-}
-
-// ScalableStore holds scalable objects.
-// TODO: Should be replaced once dynamic client is in use?
-type ScalableStore struct {
-	RCList  listerscorev1.ReplicationControllerLister
-	RSList  listersappsv1.ReplicaSetLister
-	DepList listersappsv1.DeploymentLister
-	SSList  listersappsv1.StatefulSetLister
+	IdlerClient iclient.IdlersGetter
 }
 
 // NewResourceStore creates a ResourceStore for use by force-sleeper and auto-idler
-func NewResourceStore(oclient osclient.Interface, kc kclient.Interface, dynamicClientPool dynamic.ClientPool, scaleClient scale.ScalesGetter, informerfactory informers.SharedInformerFactory, projectInformer kcache.SharedIndexInformer) *ResourceStore {
+func NewResourceStore(kc kclient.Interface, dynamicClientPool dynamic.ClientPool, idlersClient iclient.IdlersGetter, informerfactory informers.SharedInformerFactory, projectInformer kcache.SharedIndexInformer) *ResourceStore {
 	informer := informerfactory.Core().V1().Pods()
 	scalableStore := NewScalableStore(informerfactory)
 	pl := listerscorev1.NewNamespaceLister(projectInformer.GetIndexer())
 	resourceStore := &ResourceStore{
 		KubeClient:  kc,
-		OSClient:    oclient,
 		PodList:     informer.Lister(),
 		ProjectList: pl,
 		ServiceList: informerfactory.Core().V1().Services().Lister(),
 		Scalables:   scalableStore,
 		ClientPool:  dynamicClientPool,
-		ScaleClient: scaleClient,
+		IdlersClient: idlersClient,
 	}
 	informer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
 		DeleteFunc: func(podRaw interface{}) {
@@ -85,16 +71,6 @@ func NewResourceStore(oclient osclient.Interface, kc kclient.Interface, dynamicC
 		},
 	})
 	return resourceStore
-}
-
-func NewScalableStore(informerfactory informers.SharedInformerFactory) *ScalableStore {
-	scalableStore := &ScalableStore{
-		RCList:  informerfactory.Core().V1().ReplicationControllers().Lister(),
-		RSList:  informerfactory.Apps().V1().ReplicaSets().Lister(),
-		DepList: informerfactory.Apps().V1().Deployments().Lister(),
-		SSList:  informerfactory.Apps().V1().StatefulSets().Lister(),
-	}
-	return scalableStore
 }
 
 // RecordDeletedPodRuntime keeps track of runtimes of dead pods per namespace as project annotation
@@ -173,112 +149,12 @@ func (rs *ResourceStore) ResourceIsScalable(resource, kind string) bool {
 	return scalable
 }
 
-// CrossGroupObjectReference allows for working with objects across groups
-type CrossGroupObjectReference struct {
-	// Kind of the referent; More info: http://releases.k8s.io/release-1.3/docs/devel/api-conventions.md#types-kinds"
-	Kind string `json:"kind" protobuf:"bytes,1,opt,name=kind"`
-	// Name of the referent; More info: http://releases.k8s.io/release-1.3/docs/user-guide/identifiers.md#names
-	Name string `json:"name" protobuf:"bytes,2,opt,name=name"`
-	// API version of the referent (deprecated, prefer usng Group instead)
-	APIVersion string `json:"apiVersion,omitempty" protobuf:"bytes,3,opt,name=apiVersion"`
-	// Group of the referent
-	Group string `json:"group,omitempty" protobuf:"bytes,3,opt,name=group"`
-	// Resource of the referent
-	Resource string `json:"group,omitempty" protobuf:"bytes,3,opt,name=resource"`
-}
-
-// UpdateObjectScale updates the scale of an object and removes unidling annotations for objects of a known type.
-// For objects of an unknown type, it scales the object using the scale subresource
-// TODO: Use dynamic client instead of switch
-func (rs *ResourceStore) UpdateObjectScale(namespace string, ref CrossGroupObjectReference, obj runtime.Object, scale *autoscalingv1.Scale) error {
-	gr := schema.GroupResource{Group: ref.Group, Resource: ref.Kind}
-	var err error
-	if obj == nil {
-		_, err = rs.ScaleClient.Scales(namespace).Update(gr, scale)
-		return err
-	}
-
-	switch ref.Kind {
-	case DCKind:
-		dcInterface := rs.OSClient.AppsV1().DeploymentConfigs(namespace)
-		dc, err := dcInterface.Get(ref.Name, metav1.GetOptions{})
-		if err != nil {
-			return err
-		}
-
-		dcCopy := dc.DeepCopy()
-		dcCopy.Spec.Replicas = scale.Spec.Replicas
-		_, err = dcInterface.Update(dcCopy)
-		if err != nil {
-			return err
-		}
-	case RCKind:
-		rc, err := rs.Scalables.RCList.ReplicationControllers(namespace).Get(ref.Name)
-		if err != nil {
-			return err
-		}
-
-		rc.Spec.Replicas = int32Ptr(scale.Spec.Replicas)
-		_, err = rs.KubeClient.CoreV1().ReplicationControllers(namespace).Update(rc)
-		if err != nil {
-			return err
-		}
-
-	default:
-		glog.V(2).Infof("unknown type %v", obj)
-		_, err = rs.ScaleClient.Scales(namespace).Update(gr, scale)
-	}
-
-	return err
-}
-
-// GetObjectsWithScale is called whenever we need to collect or update an object's scale
-// TODO: Use dynamic client instead of switch
-func (rs *ResourceStore) GetObjectWithScale(namespace string, ref CrossGroupObjectReference) (runtime.Object, *autoscalingv1.Scale, error) {
-	var obj runtime.Object
-	var err error
-	var scale *autoscalingv1.Scale
-
-	switch {
-	case ref.Kind == DCKind && (ref.Group == appsV1GroupName || ref.Group == ""):
-		var dc *appsv1.DeploymentConfig
-		dcInterface := rs.OSClient.AppsV1().DeploymentConfigs(namespace)
-		dcList, err := dcInterface.List(metav1.ListOptions{})
-		if err != nil {
-			return nil, nil, err
-		}
-		dc = &dcList.Items[0]
-		scale = &autoscalingv1.Scale{
-			Spec: autoscalingv1.ScaleSpec{Replicas: dc.Spec.Replicas},
-		}
-		obj = dc
-	case ref.Kind == RCKind && ref.Group == corev1.GroupName:
-		var rc *corev1.ReplicationController
-		rc, err = rs.Scalables.RCList.ReplicationControllers(namespace).Get(ref.Name)
-		if err != nil {
-			return nil, nil, err
-		}
-		scale = &autoscalingv1.Scale{
-			Spec: autoscalingv1.ScaleSpec{Replicas: *rc.Spec.Replicas},
-		}
-		obj = rc
-	default:
-		gr := schema.GroupResource{Group: ref.Group, Resource: ref.Resource}
-		scale, err = rs.ScaleClient.Scales(namespace).Get(gr, ref.Name)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	return obj, scale, err
-}
-
-// GetScalableObjRefsInNamespace returns a reference to scalable objects in a namespace
+// getTargetScalablesInProject gets info for svcidler.TargetScalables
 // Takes a namespace to find scalable objects and their parent object
 // Then takes that list of parent objects and checks if there is another parent above them
 // ex. pod -> RC -> DC, DC is the main parent object we want to scale
-func (rs *ResourceStore) GetScalableObjRefsInProject(namespace string) (map[CrossGroupObjectReference]*corev1.ObjectReference, error) {
-	resultMap := make(map[CrossGroupObjectReference]*corev1.ObjectReference)
+func (rs *ResourceStore) getTargetScalablesInProject(namespace string) ([]svcidler.CrossGroupObjectReference, error) {
+	var targetScalables []svcidler.CrossGroupObjectReference
 	// APIResList is a []*metav1.APIResourceList
 	APIResList, err := rs.KubeClient.Discovery().ServerPreferredNamespacedResources()
 	if err != nil {
@@ -334,21 +210,20 @@ func (rs *ResourceStore) GetScalableObjRefsInProject(namespace string) (map[Cros
 							APIVersion: gv.String(),
 						}
 					}
-					isUnique := true
-					for cgr, _ := range resultMap {
+					// Check if unique
+					for i, cgr := range targetScalables {
 						// TODO: Check to make sure this is enough...
 						if objRef.Name == cgr.Name {
-							isUnique = false
+							continue
 						}
 					}
-					if objRef != nil && isUnique {
-						cgr := CrossGroupObjectReference{
-							Kind:       objRef.Kind,
+					if objRef != nil {
+						cgr := svcidler.CrossGroupObjectReference{
 							Name:       objRef.Name,
-							APIVersion: objRef.APIVersion,
 							Group:      gv.Group,
+							Resource:	objRef.Kind,
 						}
-						resultMap[cgr] = objRef
+						targetScalables = append(targetScalables, cgr)
 					}
 					return nil
 				})
@@ -358,13 +233,49 @@ func (rs *ResourceStore) GetScalableObjRefsInProject(namespace string) (map[Cros
 			}
 		}
 	}
-	if len(resultMap) == 0 {
+	if len(targetScalables) == 0 {
 		glog.V(0).Infof("no scalable objects found in project( %s )", namespace)
 	}
 	if failed {
 		return nil, fmt.Errorf("error finding scalable object references in namespace( %s )", namespace)
 	}
-	return resultMap, nil
+	return targetScalables, nil
+}
+
+// getIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
+func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling bool) ([]string, error) {
+	// if !forIdling, the force-sleeper has called this.. so don't want to fill TriggerSvcNames yet, until 
+	// project is 'woken up' by removing force-sleep quota, then we'll populate the TriggerServiceNames
+	if !forIdling {
+		return nil, nil
+	}
+	var triggerSvcName []string
+	svcsInProj, err := rs.ServiceList.Services(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	podsInProj, err := rs.PodList.Pods(namespace).List(metav1.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	// return quickly if project has no services or has no pods
+	if len(svcsInProj) == 0 || len(podsInProj) == 0{
+		return nil, nil
+	}
+	// now see if there are pods associated with service in project
+	for _, svc := range svcsInProj {
+		podsWSvc, err := GetPodsForService(svc, podsInProj)
+		if err != nil {
+			return nil, err
+		}
+		if len(podsWSvc) == 0 {
+			return nil, nil
+		}
+		for _, pod := range podsWSvc{
+			triggerSvcName = append(triggerSvcName, svc.Name)
+		}
+	}
+	return triggerSvcName, nil
 }
 
 // IsAsleep returns bool based on project IsAsleepAnnotation
@@ -382,5 +293,28 @@ func (rs *ResourceStore) IsAsleep(p string) (bool, error) {
 	return isAsleep, nil
 }
 
-// borrowed this convenience function from k8s.io/client-go/examples/create-update-delete-deployment
-func int32Ptr(i int32) *int32 { return &i }
+// CreateIdler creates an Idler named cache.HibernationIdler in given namespace.
+// Note, if called by force-sleeper when placing project to sleep via resource quota, 
+// TriggerServiceNames is kept at nil, until quota is removed, at which point, Idler will
+// be updated with TriggerServiceNames.
+func (rs *ResourceStore) CreateIdler(namespace string, forIdling bool) error {
+	triggerServiceNames, err := rs.getIdlerTriggerServiceNames(namesapce, forIdling)
+	if err != nil {
+		return err
+	}
+	targetScalables, err := rs.getTargetScalables(namespace)
+	idler := &svcidler.Idler{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: HibernationIdler,
+		},
+		Spec: svcidler.IdlerSpec{
+			WantIdle: wantIdle,
+			TargetScalables: targetScalables,
+			TriggerServiceNames: triggerServiceNames,
+		},
+	}
+	_, err = rs.IdlersClient.Idlers(namesapce).Create(idler)
+	if err != nil {
+		return err
+	}
+}

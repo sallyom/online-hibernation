@@ -182,7 +182,7 @@ func (s *Sleeper) syncProject(namespace string) {
 	if quotaSecondsConsumed > s.config.Quota.Seconds() {
 		// Project-level sleep
 		glog.V(2).Infof("Force-sleeper: Project( %s )over quota! (%+vs/%+vs), applying force-sleep...", namespace, quotaSecondsConsumed, s.config.Quota.Seconds())
-		err = s.applyProjectSleep(namespace, nowTime, nowTime.Add(s.config.ProjectSleepPeriod))
+		err = s.applyProjectSleep(namespace, nowTime)
 		if err != nil {
 			glog.Errorf("Force-sleeper: Error applying project( %s )sleep quota: %s", namespace, err)
 			return
@@ -199,11 +199,11 @@ func (s *Sleeper) syncProject(namespace string) {
 }
 
 // applyProjectSleep creates force-sleep quota in namespace, scales scalable objects, and adds necessary annotations
-func (s *Sleeper) applyProjectSleep(namespace string, sleepTime, wakeTime time.Time) error {
+func (s *Sleeper) applyProjectSleep(namespace string, sleepTime time.Time) error {
 	if s.config.DryRun {
 		glog.V(2).Infof("Force-sleeper DryRun: Simulating project( %s )sleep in dry run mode", namespace)
 	}
-	// TODO: this ok in DryRun?
+	// TODO: ok to do in DryRun?
 	// Add force-sleep annotation to project
 	err := s.addNamespaceSleepTimeAnnotation(namespace, sleepTime)
 	if err != nil {
@@ -222,17 +222,11 @@ func (s *Sleeper) applyProjectSleep(namespace string, sleepTime, wakeTime time.T
 		failed = true
 		glog.Errorf("Force-sleeper: %s", err)
 	}
-	glog.V(2).Infof("Force-sleeper: Annotating services in project( %s )", namespace)
-	err = s.resourceStore.AddProjectPreviousScaleAnnotation(namespace)
+	glog.V(2).Infof("Force-sleeper: Scaling objects in project( %s )", namespace)
+	err = rs.CreateIdler(namespace, false)
 	if err != nil {
 		failed = true
 		glog.Errorf("Force-sleeper: %s", err)
-	}
-	glog.V(2).Infof("Force-sleeper: Scaling objects in project( %s )", namespace)
-	err = s.resourceStore.ScaleAllScalableObjectsInNamespace(namespace)
-	if err != nil {
-		failed = true
-		glog.Errorf("Force-sleeper: Error scaling objects in project( %s ): %s", namespace, err)
 	}
 	if failed {
 		glog.Errorf("Force-sleeper: Error applying sleep for project %s", namespace)
@@ -313,7 +307,6 @@ func (s *Sleeper) wakeProject(namespace string) error {
 			failed = true
 			glog.Errorf("Force-sleeper: Error removing project( %s )sleep time annotation: %s", namespace, err)
 		}
-		// Don't add Idled-At annotations if DryRun=true
 		if s.config.DryRun {
 			glog.V(0).Infof("Force-sleeper: DryRunMode, removing DeadPodRuntime annotation in project( %s )", namespace)
 			// Have to do this as separate step, bc only want to delete here if in DryRun.. otherwise delete of DeadPodRuntime happens after idling annotation
@@ -328,12 +321,26 @@ func (s *Sleeper) wakeProject(namespace string) error {
 				return fmt.Errorf("Force-sleeper: Error: %s", err)
 			}
 		} else {
-			glog.V(2).Infof("Force-sleeper: Adding project( %s )Idled-At annotations", namespace)
-			err = s.resourceStore.AddProjectIdledAtAnnotation(namespace, nowTime, s.config.ProjectSleepPeriod)
+			glog.V(2).Infof("Force-sleeper: Adding project( %s )TriggerServiceNames for idling", namespace)
+			idler, err := s.resourceStore.IdlersClient(namespace).Get(cache.HibernationIdler)
 			if err != nil {
 				failed = true
-				glog.Errorf("Force-sleeper: Error applying project idled-at service annotations: %s", err)
+				glog.Errorf("Force-sleeper: Error getting service-idler in project( %s ): %s", namespace, err)
 			}
+			idlerCopy := idler.DeepCopy()
+			triggerSvcNames, err := rs.GetTriggerServiceNames(namespace, true)
+			if err != nil {
+				failed = true
+				return fmt.Errorf("Force-sleeper: Error: %s", err)
+			}
+			// TODO: Do I need to check that WantIdle = true here?
+			idlerCopy.Spec.TriggerServiceNames = triggerSvcNames
+			_, err = rs.IdlersClient.Idlers(namesapce).Update(idlerCopy)
+			if err != nil {
+				failed = true
+				return fmt.Errorf("Force-sleeper: Error: %s", err)
+			}
+
 		}
 		project, err := s.resourceStore.ProjectList.Get(namespace)
 		if err != nil {

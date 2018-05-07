@@ -259,16 +259,7 @@ func (idler *AutoIdler) checkForScalables(namespace string) (bool, error) {
 	return scalable, nil
 }
 
-// autoIdleProjectServices re-creates `oc idle`
-// `oc idle` links controllers to endpoints by:
-//   1. taking in an endpoint (service name)
-//   2. getting the pods on that endpoint
-//   3. getting the controller on each pod (and, in the case of DCs, getting the controller on that controller)
-// This approach is:
-//   1. loop through all services in project
-//   2. for each service, get pods on service by label selector
-//   3. get the controller on each pod (and, in the case of DCs, get the controller on that controller)
-//   4. get endpoint with the same name as the service
+// autoIdleProjectServices re-creates `oc idle` using openshift/service-idler
 func (idler *AutoIdler) autoIdleProjectServices(namespace string) error {
 	nowTime := time.Now()
 	isAsleep, err := idler.resourceStore.IsAsleep(namespace)
@@ -280,22 +271,10 @@ func (idler *AutoIdler) autoIdleProjectServices(namespace string) error {
 		return nil
 	}
 
-	glog.V(0).Infof("Auto-idler: Adding previous scale annotation in project( %s )", namespace)
-	err = idler.resourceStore.AddProjectPreviousScaleAnnotation(namespace)
-	if err != nil {
-		return fmt.Errorf("Error adding project( %s )previous scale annotation: %s", namespace, err)
-	}
-
 	glog.V(2).Infof("Auto-idler: Scaling  objects in project %s", namespace)
-	err = idler.resourceStore.ScaleAllScalableObjectsInNamespace(namespace)
+	err = idler.resourceStore.CreateIdler(namespace, true)
 	if err != nil {
 		return fmt.Errorf("Error scaling objects in project %s: %s", namespace, err)
-	}
-
-	glog.V(0).Infof("Auto-idler: Adding idled-at annotation in project( %s )", namespace)
-	err = idler.resourceStore.AddProjectIdledAtAnnotation(namespace, nowTime, idler.config.ProjectSleepPeriod)
-	if err != nil {
-		return fmt.Errorf("Error adding idled-at annotation in project( %s ): %v", namespace, err)
 	}
 
 	glog.V(2).Infof("Auto-idler: Project( %s )endpoints are now idled", namespace)
