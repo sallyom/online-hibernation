@@ -1,6 +1,7 @@
 package autoidling
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"testing"
@@ -17,55 +18,65 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kappsv1 "k8s.io/api/apps/v1"
 	fakekclientset "k8s.io/client-go/kubernetes/fake"
-	fakescale "k8s.io/client-go/scale/fake"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
-	//restclient "k8s.io/client-go/rest"
+	fakeidlersclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2/fake"
 	ktesting "k8s.io/client-go/testing"
 	kcache "k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	informerscorev1 "k8s.io/client-go/informers/core/v1"
 	listerscorev1 "k8s.io/client-go/listers/core/v1"
-	informers "k8s.io/client-go/informers"
-	utilwait "k8s.io/apimachinery/pkg/util/wait"
 )
+
+func makeServiceLister(services []*corev1.Service) listerscorev1.ServiceLister {
+	c := kcache.NewIndexer(kcache.MetaNamespaceKeyFunc, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc})
+	for _, svc := range services {
+		if err := c.Add(svc); err != nil {
+			fmt.Errorf("%s", err)
+			return nil
+		}
+	}
+	lister := listerscorev1.NewServiceLister(c)
+	return lister
+}
+
+func makeNamespaceLister(namespaces []*corev1.Namespace) listerscorev1.NamespaceLister {
+	c := kcache.NewIndexer(kcache.MetaNamespaceKeyFunc, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc})
+	for _, ns := range namespaces {
+		if err := c.Add(ns); err != nil {
+			fmt.Errorf("%s", err)
+			return nil
+		}
+	}
+	lister := listerscorev1.NewNamespaceLister(c)
+	return lister
+}
+
+func makePodLister(pods []*corev1.Pod) listerscorev1.PodLister {
+	c := kcache.NewIndexer(kcache.MetaNamespaceKeyFunc, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc})
+	for _, pod := range pods {
+		if err := c.Add(pod); err != nil {
+			fmt.Errorf("%s", err)
+			return nil
+		}
+	}
+	lister := listerscorev1.NewPodLister(c)
+	return lister
+}
 
 func init() {
 	log.SetOutput(os.Stdout)
 }
 
-// This is copied from cmd.go
-func tweakListOpts(options *metav1.ListOptions) {
-	selectormap := map[string]string{cache.HibernationLabel: "true"}
-	selector, _ := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectormap})
-	labelselector := selector.String()
-	options.LabelSelector = labelselector
-}
-
-func NewFakeResourceStore(oclient fakeoclientset.Clientset, kc fakekclientset.Clientset, dynamicClientPool fakedynamic.FakeClientPool, scaleClient fakescale.FakeScaleClient, informerfactory informers.SharedInformerFactory, projectInformer kcache.SharedIndexInformer) *cache.ResourceStore {
-	informer := informerfactory.Core().V1().Pods()
-	scalableStore := cache.NewScalableStore(informerfactory)
-	pl := listerscorev1.NewNamespaceLister(projectInformer.GetIndexer())
-	resourceStore := &cache.ResourceStore{
-		KubeClient:  &kc,
-		OSClient:    &oclient,
-		PodList:     informer.Lister(),
-		ProjectList: pl,
-		ServiceList: informerfactory.Core().V1().Services().Lister(),
-		Scalables:   scalableStore,
-		ClientPool:  &dynamicClientPool,
-		ScaleClient: &scaleClient,
+func NewFakeResourceStore(pods []*corev1.Pod, projects []*corev1.Namespace, services []*corev1.Service) *cache.ResourceStore {
+	resourceStore := &cache.ResourceStore {
+		KubeClient: fakekclientset.NewSimpleClientset(),
+		PodList: makePodLister(pods),
+		ProjectList: makeNamespaceLister(projects),
+		ServiceList: makeServiceLister(services),
+		ClientPool: &fakedynamic.FakeClientPool{},
+		IdlersClient: &fakeidlersclient.FakeIdlingV1alpha2{},
 	}
-	informer.Informer().AddEventHandler(kcache.ResourceEventHandlerFuncs{
-		DeleteFunc: func(podRaw interface{}) {
-			pod := podRaw.(*corev1.Pod)
-			if err := resourceStore.RecordDeletedPodRuntime(pod); err != nil {
-				utilruntime.HandleError(err)
-			}
-		},
-	})
 	return resourceStore
 }
 
@@ -147,6 +158,14 @@ func TestSync(t *testing.T) {
 			return true, list, nil
 		})
 
+		fakeClient.AddReactor("list", "namespaces", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
+			list := &corev1.NamespaceList{}
+			for i := range test.projects {
+				list.Items = append(list.Items, *test.projects[i])
+			}
+			return true, list, nil
+		})
+
 		fakeClient.AddReactor("list", "services", func(action ktesting.Action) (handled bool, resp runtime.Object, err error) {
 			list := &corev1.ServiceList{}
 			for i := range test.services {
@@ -186,27 +205,17 @@ func TestSync(t *testing.T) {
 			}
 			return true, list, nil
 		})
-		//clientConfig := &restclient.Config{Host: "127.0.0.1" }
-		// fakeDynamicClientPool.ClientForGroupVersionKind(kind schema.GroupVersionKind) 
-		fakeDynamicClientPool := &fakedynamic.FakeClientPool{}
-		// fakeScalesClient.Scales(namespace).Get(schema.GroupResource, name string)
-		fakeScaleClient := &fakescale.FakeScaleClient{}
-		informerFactory := informers.NewSharedInformerFactory(fakeClient, 0)
-		namespaceInformer := informerscorev1.NewFilteredNamespaceInformer(fakeClient, 0, kcache.Indexers{kcache.NamespaceIndex: kcache.MetaNamespaceIndexFunc}, tweakListOpts)
-		resources := NewFakeResourceStore(*fakeOClient, *fakeClient, *fakeDynamicClientPool, *fakeScaleClient, informerFactory, namespaceInformer)
 
-		informerFactory.Start(utilwait.NeverStop)
-		go namespaceInformer.Run(utilwait.NeverStop)
+		resources := NewFakeResourceStore(test.pods, test.projects, test.services)
 
-
-		// TODO: RESOURCE STORE IS NIL....
-		assert.Equal(t, len(test.pods), 1, "expected pods in the list")
 		podList, _ := resources.PodList.Pods("somens1").List(labels.Everything())
 		assert.Equal(t, len(podList), 1, "expected a pod")
+		svcList, _ := resources.ServiceList.Services("somens1").List(labels.Everything())
+		assert.Equal(t, len(svcList), 1, "expected a service in resourceStore")
 		podsInNS, _ := resources.PodList.Pods("somens1").List(labels.Everything())
 		assert.Equal(t, len(podsInNS), 1, "expected a pod in resourceStore")
-		nsInStore, _ := resources.ProjectList.Get("somens1")
-		assert.Equal(t, nsInStore.Name, "somens1", "expected a ns in resourceStore")
+		nsInStore, _ := resources.ProjectList.List(labels.Everything())
+		assert.Equal(t, len(nsInStore), 2, "expected a ns in resourceStore")
 		idler := NewAutoIdler(config, resources)
 		idler.sync(test.netmap)
 		assert.Equal(t, idler.queue.Len(), test.expectedQueueLen, "expected items did not match actual items in workqueue")

@@ -28,7 +28,6 @@ const (
 	ProjectDeadPodsRuntimeAnnotation = "openshift.io/project-dead-pods-runtime"
 	HibernationLabel                 = "openshift.io/hibernate-include"
 	HibernationIdler				 = "hibernation"
-	ProjectIsAsleepAnnotation        = "openshift.io/project-is-asleep"
 	ProjectSleepQuotaName            = "force-sleep"
 	OpenShiftDCName                  = "openshift.io/deployment-config.name"
 	BuildAnnotation                  = "openshift.io/build.name"
@@ -240,26 +239,26 @@ func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling
 	// if !forIdling, the force-sleeper has called this.. so don't want to fill TriggerSvcNames yet, until 
 	// project is 'woken up' by removing force-sleep quota, then we'll populate the TriggerServiceNames
 	if !forIdling {
-		return nil, nil
+		return []string{}, nil
 	}
 	var triggerSvcName []string
 	svcsInProj, err := rs.ServiceList.Services(namespace).List(labels.Everything())
 	if err != nil {
-		return nil, err
+		return []string{}, err
 	}
 	podsInProj, err := rs.PodList.Pods(namespace).List(labels.Everything())
 	if err != nil {
-		return nil, err
+		return []string{}, err
 	}
 	// return quickly if project has no services or has no pods
 	if len(svcsInProj) == 0 || len(podsInProj) == 0{
-		return nil, nil
+		return []string{}, nil
 	}
 	// now see if there are pods associated with service in project
 	for _, svc := range svcsInProj {
 		podsWSvc := rs.GetPodsForService(svc, podsInProj)
 		if len(podsWSvc) == 0 {
-			return nil, nil
+			return []string{}, nil
 		}
 		triggerSvcName = append(triggerSvcName, svc.Name)
 	}
@@ -267,41 +266,61 @@ func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling
 }
 
 // IsAsleep returns bool based on project IsAsleepAnnotation
-func (rs *ResourceStore) IsAsleep(p string) (bool, error) {
-	isAsleep := false
-	project, err := rs.ProjectList.Get(p)
+func (rs *ResourceStore) IsAsleep(proj string) (bool, error) {
+	_, err := rs.KubeClient.CoreV1().ResourceQuotas(proj).Get(ProjectSleepQuotaName, metav1.GetOptions{})
 	if err != nil {
-		return isAsleep, err
-	}
-	if val, ok := project.Annotations[ProjectIsAsleepAnnotation]; ok {
-		if val == "true" {
-			isAsleep = true
+		if !kerrors.IsNotFound(err) {
+			return false, err
 		}
+		return false, nil
 	}
-	return isAsleep, nil
+	return true, nil
 }
 
-// CreateIdler creates an Idler named cache.HibernationIdler in given namespace.
+// CreateOrUpdateIdler creates an Idler named cache.HibernationIdler in given namespace.
 // Note, if called by force-sleeper when placing project to sleep via resource quota, 
-// TriggerServiceNames is kept at nil, until quota is removed, at which point, Idler will
+// TriggerServiceNames is kept an empty array, until quota is removed, at which point, Idler will
 // be updated with TriggerServiceNames.
-func (rs *ResourceStore) CreateIdler(namespace string, forIdling bool) error {
+func (rs *ResourceStore) CreateOrUpdateIdler(namespace string, forIdling bool) error {
+	exists := true
+	idler, err := rs.IdlersClient.Idlers(namespace).Get(HibernationIdler, metav1.GetOptions{})
+	if err != nil {
+		if !kerrors.IsNotFound(err) {
+			return err
+		}
+		exists = false
+	}
 	triggerServiceNames, err := rs.GetIdlerTriggerServiceNames(namespace, forIdling)
 	if err != nil {
 		return err
 	}
 	targetScalables, err := rs.getTargetScalablesInProject(namespace)
-	idler := &svcidler.Idler{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: HibernationIdler,
-		},
-		Spec: svcidler.IdlerSpec{
-			WantIdle: true,
-			TargetScalables: targetScalables,
-			TriggerServiceNames: triggerServiceNames,
-		},
+	if !exists {
+		newIdler := &svcidler.Idler{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: HibernationIdler,
+			},
+			Spec: svcidler.IdlerSpec{
+				WantIdle: true,
+				TargetScalables: targetScalables,
+				TriggerServiceNames: triggerServiceNames,
+			},
+			Status: svcidler.IdlerStatus{
+				UnidledScales: []svcidler.UnidleInfo{},
+				InactiveServiceNames: []string{},
+			},
+		}
+		_, err = rs.IdlersClient.Idlers(namespace).Create(newIdler)
+		if err != nil {
+			return err
+		}
+		return nil
 	}
-	_, err = rs.IdlersClient.Idlers(namespace).Create(idler)
+	newIdler := idler.DeepCopy()
+	newIdler.Spec.WantIdle = true
+	newIdler.Spec.TargetScalables = targetScalables
+	newIdler.Spec.TriggerServiceNames = triggerServiceNames
+	_, err = rs.IdlersClient.Idlers(namespace).Update(newIdler)
 	if err != nil {
 		return err
 	}
