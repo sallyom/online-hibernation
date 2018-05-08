@@ -271,7 +271,7 @@ func (idler *AutoIdler) autoIdleProjectServices(namespace string) error {
 	}
 
 	glog.V(2).Infof("Auto-idler: Scaling  objects in project %s", namespace)
-	err = idler.resourceStore.CreateIdler(namespace, true)
+	err = idler.resourceStore.CreateOrUpdateIdler(namespace, true)
 	if err != nil {
 		return fmt.Errorf("Error scaling objects in project %s: %s", namespace, err)
 	}
