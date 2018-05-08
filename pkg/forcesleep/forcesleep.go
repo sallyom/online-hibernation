@@ -223,7 +223,7 @@ func (s *Sleeper) applyProjectSleep(namespace string, sleepTime time.Time) error
 		glog.Errorf("Force-sleeper: %s", err)
 	}
 	glog.V(2).Infof("Force-sleeper: Scaling objects in project( %s )", namespace)
-	err = rs.CreateIdler(namespace, false)
+	err = s.resourceStore.CreateIdler(namespace, false)
 	if err != nil {
 		failed = true
 		glog.Errorf("Force-sleeper: %s", err)
@@ -277,7 +277,6 @@ func (s *Sleeper) wakeProject(namespace string) error {
 	}
 	failed := false
 	var plst time.Time
-	nowTime := time.Now()
 	plstStr := project.Annotations[cache.ProjectLastSleepTime]
 	plst, err = time.Parse(time.RFC3339, plstStr)
 	if err != nil {
@@ -322,20 +321,20 @@ func (s *Sleeper) wakeProject(namespace string) error {
 			}
 		} else {
 			glog.V(2).Infof("Force-sleeper: Adding project( %s )TriggerServiceNames for idling", namespace)
-			idler, err := s.resourceStore.IdlersClient(namespace).Get(cache.HibernationIdler)
+			idler, err := s.resourceStore.IdlersClient.Idlers(namespace).Get(cache.HibernationIdler, metav1.GetOptions{})
 			if err != nil {
 				failed = true
 				glog.Errorf("Force-sleeper: Error getting service-idler in project( %s ): %s", namespace, err)
 			}
 			idlerCopy := idler.DeepCopy()
-			triggerSvcNames, err := rs.GetTriggerServiceNames(namespace, true)
+			triggerSvcNames, err := s.resourceStore.GetIdlerTriggerServiceNames(namespace, true)
 			if err != nil {
 				failed = true
 				return fmt.Errorf("Force-sleeper: Error: %s", err)
 			}
 			// TODO: Do I need to check that WantIdle = true here?
 			idlerCopy.Spec.TriggerServiceNames = triggerSvcNames
-			_, err = rs.IdlersClient.Idlers(namesapce).Update(idlerCopy)
+			_, err = s.resourceStore.IdlersClient.Idlers(namespace).Update(idlerCopy)
 			if err != nil {
 				failed = true
 				return fmt.Errorf("Force-sleeper: Error: %s", err)

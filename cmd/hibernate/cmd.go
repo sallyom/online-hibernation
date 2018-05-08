@@ -19,7 +19,6 @@ import (
 	flag "github.com/spf13/pflag"
 
 	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
-	osclient "github.com/openshift/client-go/apps/clientset/versioned"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,7 +30,6 @@ import (
 	informerscorev1 "k8s.io/client-go/informers/core/v1"
 	kclient "k8s.io/client-go/kubernetes"
 	restclient "k8s.io/client-go/rest"
-	"k8s.io/client-go/scale"
 	kcache "k8s.io/client-go/tools/cache"
 )
 

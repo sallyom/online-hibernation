@@ -1,5 +1,5 @@
 hash: 807e2c6c7997caa74ec55536db80a393b2405b7034aa744811963c9885e0151c
-updated: 2018-04-12T16:56:24.95070382-04:00
+updated: 2018-05-07T16:48:53.407591506-04:00
 imports:
 - name: github.com/beorn7/perks
   version: 3a771d992973f24aa725d07868b467d1ddfceafb
@@ -10,17 +10,17 @@ imports:
   subpackages:
   - spew
 - name: github.com/emicklei/go-restful
-  version: 26b41036311f2da8242db402557a0dbd09dc83da
+  version: 92cd0815dd1a028a6e69faee9757c7436238e252
   subpackages:
   - log
 - name: github.com/ghodss/yaml
-  version: 0ca9ea5df5451ffdf184b4428c902747c2c11cd7
+  version: e9ed3c6dfb39bb1a32197cb10d527906fe4da4b6
 - name: github.com/go-openapi/jsonpointer
   version: 3a0015ad55fa9873f41605d3e8f28cd279c32ab2
 - name: github.com/go-openapi/jsonreference
   version: 3fb327e6747da3043567ee86abd02bb6376b6be2
 - name: github.com/go-openapi/spec
-  version: 370d9e047557906322be8396e77cb0376be6cb96
+  version: bcff419492eeeb01f76e77d2ebc714dc97b607f5
 - name: github.com/go-openapi/swag
   version: 811b1089cde9dad18d4d0c2d09fbdbf28dbd27a5
 - name: github.com/gogo/protobuf
@@ -31,7 +31,7 @@ imports:
 - name: github.com/golang/glog
   version: 44145f04b68cf362d9c4df2182967c2275eaefed
 - name: github.com/golang/protobuf
-  version: e09c5db296004fbe3f74490e84dcd62c3c5ddb1b
+  version: b4deda0973fb4c70b50d226b1af49f3da59f5265
   subpackages:
   - proto
   - ptypes
@@ -43,7 +43,7 @@ imports:
 - name: github.com/google/gofuzz
   version: 24818f796faf91cd76ec7bddd72458fbced7a6c1
 - name: github.com/googleapis/gnostic
-  version: 6d7ae43a9ae94f90ed9912252530d97039049c66
+  version: 664776a3b48a89d0b750396afd90a7012657a293
   subpackages:
   - OpenAPIv2
   - compiler
@@ -57,7 +57,7 @@ imports:
   subpackages:
   - simplelru
 - name: github.com/json-iterator/go
-  version: f89479f5c0d83b365504d632ab57390447bb406a
+  version: 2ddf6d758266fcb080a4f9e054b9f292c85e6798
 - name: github.com/juju/ratelimit
   version: 59fac5042749a5afb9af70e813da1dd5474f0167
 - name: github.com/mailru/easyjson
@@ -90,7 +90,10 @@ imports:
   version: 3dd18c1d4ea82e2bea1c3594d0f8c379332f7264
   subpackages:
   - pkg/apis
+  - pkg/apis/idling/v1alpha2
   - pkg/client
+  - pkg/client/clientset/versioned/scheme
+  - pkg/client/clientset/versioned/typed/idling/v1alpha2
 - name: github.com/peterbourgon/diskv
   version: 0646ccaebea1ed1539efcab30cae44019090093f
 - name: github.com/prometheus/client_golang
@@ -104,7 +107,7 @@ imports:
   subpackages:
   - go
 - name: github.com/prometheus/common
-  version: 38c53a9f4bfcd932d1b00bfc65e256a7fba6b37a
+  version: d811d2e9bf898806ecfb6ef6296774b13ffc314c
   subpackages:
   - expfmt
   - internal/bitbucket.org/ww/goautoneg
@@ -126,14 +129,14 @@ imports:
   subpackages:
   - assert
 - name: golang.org/x/net
-  version: 61147c48b25b599e5b561d2e9c4f3e1ef489ca41
+  version: d11bb6cd8e3c4e60239c9cb20ef68586d74500d0
   subpackages:
   - context
   - context/ctxhttp
+  - http/httpguts
   - http2
   - http2/hpack
   - idna
-  - lex/httplex
 - name: golang.org/x/text
   version: 7922cc490dd5a7dbaa7fd5d6196b49db59ac042f
   subpackages:
@@ -147,7 +150,7 @@ imports:
 - name: gopkg.in/yaml.v2
   version: 5420a8b6744d3b0345ab293f6fcba19c978f1183
 - name: k8s.io/api
-  version: c6c40fa5f71e46739e69d43b8ce08fad9720bab9
+  version: 53400f2739169693b7f1f64cf856f6d3d780d3db
   subpackages:
   - admissionregistration/v1alpha1
   - admissionregistration/v1beta1
@@ -177,8 +180,13 @@ imports:
   - storage/v1
   - storage/v1alpha1
   - storage/v1beta1
+- name: k8s.io/apiextensions-apiserver
+  version: c689afa9f022397593aa9400cd5ca6a4ed32b6a2
+  subpackages:
+  - pkg/apis/apiextensions
+  - pkg/apis/apiextensions/v1beta1
 - name: k8s.io/apimachinery
-  version: cb88e003047fb517f284ff8af294451b20f0b403
+  version: 4a1945a9cfdfa104d202059c7e64250618d8d009
   subpackages:
   - pkg/api/errors
   - pkg/api/meta
@@ -219,11 +227,53 @@ imports:
   - pkg/watch
   - third_party/forked/golang/reflect
 - name: k8s.io/client-go
-  version: 90539b4e75a8daaf7f67c3874c6180bfb1a63936
+  version: 65b43df093d1d129e9608582d98ac9bfbba7e486
   subpackages:
   - discovery
   - discovery/cached
   - discovery/fake
+  - dynamic
+  - dynamic/fake
+  - informers
+  - informers/admissionregistration
+  - informers/admissionregistration/v1alpha1
+  - informers/admissionregistration/v1beta1
+  - informers/apps
+  - informers/apps/v1
+  - informers/apps/v1beta1
+  - informers/apps/v1beta2
+  - informers/autoscaling
+  - informers/autoscaling/v1
+  - informers/autoscaling/v2beta1
+  - informers/batch
+  - informers/batch/v1
+  - informers/batch/v1beta1
+  - informers/batch/v2alpha1
+  - informers/certificates
+  - informers/certificates/v1beta1
+  - informers/core
+  - informers/core/v1
+  - informers/events
+  - informers/events/v1beta1
+  - informers/extensions
+  - informers/extensions/v1beta1
+  - informers/internalinterfaces
+  - informers/networking
+  - informers/networking/v1
+  - informers/policy
+  - informers/policy/v1beta1
+  - informers/rbac
+  - informers/rbac/v1
+  - informers/rbac/v1alpha1
+  - informers/rbac/v1beta1
+  - informers/scheduling
+  - informers/scheduling/v1alpha1
+  - informers/settings
+  - informers/settings/v1alpha1
+  - informers/storage
+  - informers/storage/v1
+  - informers/storage/v1alpha1
+  - informers/storage/v1beta1
   - kubernetes
   - kubernetes/fake
   - kubernetes/scheme
@@ -283,9 +333,42 @@ imports:
   - kubernetes/typed/storage/v1alpha1/fake
   - kubernetes/typed/storage/v1beta1
   - kubernetes/typed/storage/v1beta1/fake
+  - listers/admissionregistration/v1alpha1
+  - listers/admissionregistration/v1beta1
+  - listers/apps/v1
+  - listers/apps/v1beta1
+  - listers/apps/v1beta2
+  - listers/autoscaling/v1
+  - listers/autoscaling/v2beta1
+  - listers/batch/v1
+  - listers/batch/v1beta1
+  - listers/batch/v2alpha1
+  - listers/certificates/v1beta1
+  - listers/core/v1
+  - listers/events/v1beta1
+  - listers/extensions/v1beta1
+  - listers/networking/v1
+  - listers/policy/v1beta1
+  - listers/rbac/v1
+  - listers/rbac/v1alpha1
+  - listers/rbac/v1beta1
+  - listers/scheduling/v1alpha1
+  - listers/settings/v1alpha1
+  - listers/storage/v1
+  - listers/storage/v1alpha1
+  - listers/storage/v1beta1
   - pkg/version
   - rest
   - rest/watch
+  - scale
+  - scale/fake
+  - scale/scheme
+  - scale/scheme/appsint
+  - scale/scheme/appsv1beta1
+  - scale/scheme/appsv1beta2
+  - scale/scheme/autoscalingv1
+  - scale/scheme/extensionsint
+  - scale/scheme/extensionsv1beta1
   - testing
   - tools/cache
   - tools/clientcmd/api
@@ -299,7 +382,7 @@ imports:
   - util/integer
   - util/workqueue
 - name: k8s.io/kube-openapi
-  version: f442ecb314a3679150c272e2b9713d8deed5955d
+  version: f08db293d3ef80052d6513ece19792642a289fea
   subpackages:
   - pkg/common
 testImports:

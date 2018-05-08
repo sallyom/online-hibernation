@@ -5,10 +5,7 @@ import (
 	"strconv"
 
 	"github.com/golang/glog"
-	appsv1 "github.com/openshift/api/apps/v1"
 	iclient "github.com/openshift/service-idler/pkg/client/clientset/versioned/typed/idling/v1alpha2"
-	osclient "github.com/openshift/client-go/apps/clientset/versioned"
-	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -20,9 +17,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	informers "k8s.io/client-go/informers"
 	kclient "k8s.io/client-go/kubernetes"
-	listersappsv1 "k8s.io/client-go/listers/apps/v1"
 	listerscorev1 "k8s.io/client-go/listers/core/v1"
-	"k8s.io/client-go/scale"
 	kcache "k8s.io/client-go/tools/cache"
 	svcidler "github.com/openshift/service-idler/pkg/apis/idling/v1alpha2"
 )
@@ -45,20 +40,18 @@ type ResourceStore struct {
 	ProjectList listerscorev1.NamespaceLister
 	ServiceList listerscorev1.ServiceLister
 	ClientPool  dynamic.ClientPool
-	IdlerClient iclient.IdlersGetter
+	IdlersClient iclient.IdlersGetter
 }
 
 // NewResourceStore creates a ResourceStore for use by force-sleeper and auto-idler
 func NewResourceStore(kc kclient.Interface, dynamicClientPool dynamic.ClientPool, idlersClient iclient.IdlersGetter, informerfactory informers.SharedInformerFactory, projectInformer kcache.SharedIndexInformer) *ResourceStore {
 	informer := informerfactory.Core().V1().Pods()
-	scalableStore := NewScalableStore(informerfactory)
 	pl := listerscorev1.NewNamespaceLister(projectInformer.GetIndexer())
 	resourceStore := &ResourceStore{
 		KubeClient:  kc,
 		PodList:     informer.Lister(),
 		ProjectList: pl,
 		ServiceList: informerfactory.Core().V1().Services().Lister(),
-		Scalables:   scalableStore,
 		ClientPool:  dynamicClientPool,
 		IdlersClient: idlersClient,
 	}
@@ -211,7 +204,7 @@ func (rs *ResourceStore) getTargetScalablesInProject(namespace string) ([]svcidl
 						}
 					}
 					// Check if unique
-					for i, cgr := range targetScalables {
+					for _, cgr := range targetScalables {
 						// TODO: Check to make sure this is enough...
 						if objRef.Name == cgr.Name {
 							continue
@@ -242,7 +235,7 @@ func (rs *ResourceStore) getTargetScalablesInProject(namespace string) ([]svcidl
 	return targetScalables, nil
 }
 
-// getIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
+// GetIdlerTriggerServiceNames populates Idler IdlerSpec.TriggerServiceNames
 func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling bool) ([]string, error) {
 	// if !forIdling, the force-sleeper has called this.. so don't want to fill TriggerSvcNames yet, until 
 	// project is 'woken up' by removing force-sleep quota, then we'll populate the TriggerServiceNames
@@ -250,11 +243,11 @@ func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling
 		return nil, nil
 	}
 	var triggerSvcName []string
-	svcsInProj, err := rs.ServiceList.Services(namespace).List(metav1.ListOptions{})
+	svcsInProj, err := rs.ServiceList.Services(namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
-	podsInProj, err := rs.PodList.Pods(namespace).List(metav1.ListOptions{})
+	podsInProj, err := rs.PodList.Pods(namespace).List(labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -264,16 +257,11 @@ func (rs *ResourceStore) GetIdlerTriggerServiceNames(namespace string, forIdling
 	}
 	// now see if there are pods associated with service in project
 	for _, svc := range svcsInProj {
-		podsWSvc, err := GetPodsForService(svc, podsInProj)
-		if err != nil {
-			return nil, err
-		}
+		podsWSvc := rs.GetPodsForService(svc, podsInProj)
 		if len(podsWSvc) == 0 {
 			return nil, nil
 		}
-		for _, pod := range podsWSvc{
-			triggerSvcName = append(triggerSvcName, svc.Name)
-		}
+		triggerSvcName = append(triggerSvcName, svc.Name)
 	}
 	return triggerSvcName, nil
 }
@@ -298,23 +286,24 @@ func (rs *ResourceStore) IsAsleep(p string) (bool, error) {
 // TriggerServiceNames is kept at nil, until quota is removed, at which point, Idler will
 // be updated with TriggerServiceNames.
 func (rs *ResourceStore) CreateIdler(namespace string, forIdling bool) error {
-	triggerServiceNames, err := rs.getIdlerTriggerServiceNames(namesapce, forIdling)
+	triggerServiceNames, err := rs.GetIdlerTriggerServiceNames(namespace, forIdling)
 	if err != nil {
 		return err
 	}
-	targetScalables, err := rs.getTargetScalables(namespace)
+	targetScalables, err := rs.getTargetScalablesInProject(namespace)
 	idler := &svcidler.Idler{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: HibernationIdler,
 		},
 		Spec: svcidler.IdlerSpec{
-			WantIdle: wantIdle,
+			WantIdle: true,
 			TargetScalables: targetScalables,
 			TriggerServiceNames: triggerServiceNames,
 		},
 	}
-	_, err = rs.IdlersClient.Idlers(namesapce).Create(idler)
+	_, err = rs.IdlersClient.Idlers(namespace).Create(idler)
 	if err != nil {
 		return err
 	}
+	return nil
 }

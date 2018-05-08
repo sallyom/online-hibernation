@@ -261,7 +261,6 @@ func (idler *AutoIdler) checkForScalables(namespace string) (bool, error) {
 
 // autoIdleProjectServices re-creates `oc idle` using openshift/service-idler
 func (idler *AutoIdler) autoIdleProjectServices(namespace string) error {
-	nowTime := time.Now()
 	isAsleep, err := idler.resourceStore.IsAsleep(namespace)
 	if err != nil {
 		return err
