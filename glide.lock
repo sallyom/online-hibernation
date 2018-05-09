@@ -1,5 +1,5 @@
 hash: 807e2c6c7997caa74ec55536db80a393b2405b7034aa744811963c9885e0151c
-updated: 2018-05-07T16:48:53.407591506-04:00
+updated: 2018-05-09T11:23:22.689144395-04:00
 imports:
 - name: github.com/beorn7/perks
   version: 3a771d992973f24aa725d07868b467d1ddfceafb
@@ -94,6 +94,7 @@ imports:
   - pkg/client
   - pkg/client/clientset/versioned/scheme
   - pkg/client/clientset/versioned/typed/idling/v1alpha2
+  - pkg/client/clientset/versioned/typed/idling/v1alpha2/fake
 - name: github.com/peterbourgon/diskv
   version: 0646ccaebea1ed1539efcab30cae44019090093f
 - name: github.com/prometheus/client_golang
@@ -129,7 +130,7 @@ imports:
   subpackages:
   - assert
 - name: golang.org/x/net
-  version: d11bb6cd8e3c4e60239c9cb20ef68586d74500d0
+  version: f73e4c9ed3b7ebdd5f699a16a880c2b1994e50dd
   subpackages:
   - context
   - context/ctxhttp
@@ -181,7 +182,7 @@ imports:
   - storage/v1alpha1
   - storage/v1beta1
 - name: k8s.io/apiextensions-apiserver
-  version: c689afa9f022397593aa9400cd5ca6a4ed32b6a2
+  version: a38b42548714fc521aa31aaa63a60cb93984e3bc
   subpackages:
   - pkg/apis/apiextensions
   - pkg/apis/apiextensions/v1beta1
@@ -360,15 +361,6 @@ imports:
   - pkg/version
   - rest
   - rest/watch
-  - scale
-  - scale/fake
-  - scale/scheme
-  - scale/scheme/appsint
-  - scale/scheme/appsv1beta1
-  - scale/scheme/appsv1beta2
-  - scale/scheme/autoscalingv1
-  - scale/scheme/extensionsint
-  - scale/scheme/extensionsv1beta1
   - testing
   - tools/cache
   - tools/clientcmd/api
@@ -382,7 +374,7 @@ imports:
   - util/integer
   - util/workqueue
 - name: k8s.io/kube-openapi
-  version: f08db293d3ef80052d6513ece19792642a289fea
+  version: 61db125d227fc9d4e373819a059516f32f7f23c7
   subpackages:
   - pkg/common
 testImports:
